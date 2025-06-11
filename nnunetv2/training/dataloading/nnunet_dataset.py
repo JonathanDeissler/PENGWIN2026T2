@@ -14,6 +14,7 @@ from batchgenerators.utilities.file_and_folder_operations import join, load_pick
 from nnunetv2.configuration import default_num_processes
 from nnunetv2.training.dataloading.utils import unpack_dataset
 import math
+import json
 
 
 class nnUNetBaseDataset(ABC):
@@ -149,6 +150,30 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
 
         properties = load_pickle(join(self.source_folder, identifier + '.pkl'))
         return data, seg, seg_prev, properties
+
+    def load_case_with_clicks(self, identifier):
+        dparams = {
+            'nthreads': 1
+        }
+        data_b2nd_file = join(self.source_folder, identifier + '.b2nd')
+        data = blosc2.open(urlpath=data_b2nd_file, mode='r', dparams=dparams, mmap_mode='r')
+
+        seg_b2nd_file = join(self.source_folder, identifier + '_seg.b2nd')
+        seg = blosc2.open(urlpath=seg_b2nd_file, mode='r', dparams=dparams, mmap_mode='r')
+
+        seg_org = None
+
+        click_json = join(self.source_folder, os.pardir, "clicksTr", identifier + '_clicks.json')
+        click_json = self.load_json(click_json)
+
+        properties = load_pickle(join(self.source_folder, identifier + '.pkl'))
+        return data, seg, seg_org, properties, click_json
+
+    @staticmethod
+    def load_json(json_file: str):
+        with open(json_file, "r") as f:
+            data = json.load(f)
+        return data
 
     @staticmethod
     def save_case(

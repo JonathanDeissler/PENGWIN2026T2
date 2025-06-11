@@ -50,7 +50,7 @@ from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 from nnunetv2.inference.sliding_window_prediction import compute_gaussian
 from nnunetv2.paths import nnUNet_preprocessed, nnUNet_results
 from nnunetv2.training.data_augmentation.compute_initial_patch_size import get_patch_size
-from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
+from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class, nnUNetDatasetBlosc2
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
@@ -622,7 +622,7 @@ class nnUNetTrainer(object):
 
     def get_dataloaders(self):
         if self.dataset_class is None:
-            self.dataset_class = infer_dataset_class(self.preprocessed_dataset_folder)
+            self.dataset_class = nnUNetDatasetBlosc2(self.preprocessed_dataset_folder)
 
         # we use the patch size to determine whether we need 2D or 3D dataloaders. We also use it to determine whether
         # we need to use dummy 2D augmentation (in case of 3D training) and what our initial patch size should be
