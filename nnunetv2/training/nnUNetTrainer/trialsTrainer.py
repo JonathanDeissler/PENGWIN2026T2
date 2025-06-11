@@ -384,11 +384,11 @@ class trialsTrainer(nnUNetTrainer):
         else:
             mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
                                                         num_processes=allowed_num_processes,
-                                                        num_cached=max(2, allowed_num_processes // 2), seeds=None,
+                                                        num_cached=max(6, allowed_num_processes // 2), seeds=None,
                                                         pin_memory=self.device.type == 'cuda', wait_time=0.002)
             mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
                                                       transform=None, num_processes=max(1, allowed_num_processes // 2),
-                                                      num_cached=max(1, allowed_num_processes // 4), seeds=None,
+                                                      num_cached=max(3, allowed_num_processes // 4), seeds=None,
                                                       pin_memory=self.device.type == 'cuda',
                                                       wait_time=0.002)
         # # let's get this party started
