@@ -95,6 +95,48 @@ def preprocess_point(point, data_properties, shape):
         z = np.round(z * factor[0]).astype(np.uint16)
         return [z, y, x]
 
+# Experimental speedup tech
+from scipy.ndimage import convolve1d
+
+def gaussian_kernel(size: int, sigma: float) -> np.ndarray:
+    x = np.arange(-size // 2 + 1., size // 2 + 1.)
+    kernel = np.exp(-x**2 / (2 * sigma**2))
+    kernel /= kernel.sum()
+    return kernel
+
+def separable_gaussian_3d(arr: np.ndarray, sigma: float) -> np.ndarray:
+    size = int(2 * np.ceil(3 * sigma) + 1)
+    kernel = gaussian_kernel(size, sigma)
+    arr = convolve1d(arr, kernel, axis=0, mode='constant')
+    arr = convolve1d(arr, kernel, axis=1, mode='constant')
+    arr = convolve1d(arr, kernel, axis=2, mode='constant')
+    return arr
+
+
+import time
+
+def sparse_to_dense_point_gauss_timed(points: dict[str, np.ndarray], shape: tuple[int, ...], properties: dict, sigma: float = 1.0) -> np.ndarray:
+    start_time = time.time()  # Start timing
+    pos_clicks, neg_clicks = np.zeros(shape, dtype=np.float32), np.zeros(shape, dtype=np.float32)
+    if len(points) > 0:
+        for clck in points:
+            coord = clck['point']
+            label = clck['name']
+            coord = preprocess_point(coord, properties, shape)
+            if label == 'tumor':
+                pos_clicks[*coord] = 1.0
+            elif label == 'background':
+                neg_clicks[*coord] = 1.0 # self.place_point(coord, neg_clicks, n_clck + 1)
+            else:
+                raise ValueError(f"Unknown label {label} in click json")
+        start_gaussioan_filter_time = time.time()  # Start timing for Gaussian filter
+        pos_clicks = separable_gaussian_3d(pos_clicks, sigma=sigma)
+        neg_clicks = separable_gaussian_3d(neg_clicks, sigma=sigma)
+        print(f"Gaussian filter execution time: {time.time() - start_gaussioan_filter_time:.4f} seconds")
+    end_time = time.time()  # End timing
+    print(f"sparse_to_dense_point_gauss execution time: {end_time - start_time:.4f} seconds")
+    return pos_clicks, neg_clicks
+
 
 def sparse_to_dense_point_gauss(points: dict[str, np.ndarray], shape: tuple[int, ...], properties: dict, sigma: float = 1.0) -> np.ndarray:
     pos_clicks, neg_clicks = np.zeros(shape, dtype=np.float32), np.zeros(shape, dtype=np.float32)
@@ -109,8 +151,8 @@ def sparse_to_dense_point_gauss(points: dict[str, np.ndarray], shape: tuple[int,
                 neg_clicks[*coord] = 1.0 # self.place_point(coord, neg_clicks, n_clck + 1)
             else:
                 raise ValueError(f"Unknown label {label} in click json")
-        pos_clicks = gaussian_filter(pos_clicks, sigma=sigma)
-        neg_clicks = gaussian_filter(neg_clicks, sigma=sigma)
+        pos_clicks = separable_gaussian_3d(pos_clicks, sigma=sigma)
+        neg_clicks = separable_gaussian_3d(neg_clicks, sigma=sigma)
     return pos_clicks, neg_clicks
 
 
