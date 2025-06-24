@@ -224,6 +224,14 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
         case_identifiers = [i[:-5] for i in os.listdir(folder) if i.endswith(".b2nd") and not i.endswith("_seg.b2nd")]
         return case_identifiers
 
+    def get_dataset_identifiers(self) -> List[str]:
+        """
+        returns all identifiers of the Dataset
+        """
+        assert self.identifiers is not None, "Identifiers have not been set yet. You cant get them before eou initiallized the dataset"
+        return self.identifiers
+
+
     @staticmethod
     def unpack_dataset(folder: str, overwrite_existing: bool = False,
                        num_processes: int = default_num_processes,

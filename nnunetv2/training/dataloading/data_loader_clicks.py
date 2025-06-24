@@ -3,6 +3,7 @@ import warnings
 from typing import Union, Tuple, List
 
 import numpy as np
+import time
 import torch
 from skimage.morphology import ball
 from threadpoolctl import threadpool_limits
@@ -14,8 +15,97 @@ from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
 from nnunetv2.training.dataloading.utils import generated_sparse_to_dense_point_gauss, sparse_to_dense_point_gauss
 # from nnunetv2.training.dataloading.utils simulate_clicks
 
+from nnunetv2.training.dataloading.utils import restructure_clicks
+
 
 class nnUNetDataLoaderClicks(nnUNetDataLoader):
+
+
+    def generate_train_batch_time_debug(self):
+        start_time = time.time()
+        print("Starting generate_train_batch...")
+
+        selected_keys = self.get_indices()
+        print(f"Selected keys: {selected_keys}")
+
+        # preallocate memory for data and seg
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+        clicks_all = np.zeros((self.data_shape[0], 2, *self.data_shape[2:]), dtype=np.float32)
+
+        for j, i in enumerate(selected_keys):
+            force_fg = self.get_do_oversample(j)
+
+            data, seg, seg_prev, properties, click_json = self._data.load_case_with_clicks(i)
+            print(f"Loaded data shape: {data.shape}, seg shape: {seg.shape}")
+
+            shape = data.shape[1:]
+            restructured_clicks = restructure_clicks(click_json)
+
+            num_clicks = np.random.randint(0, len(restructured_clicks["points"]) + 1)
+            clicks = np.random.choice(restructured_clicks['points'], size=num_clicks, replace=False)
+
+            convert_time = time.time()
+            pos_clicks, neg_clicks = sparse_to_dense_point_gauss(clicks, shape, properties, sigma=3)
+
+            print(f"Generated positive and negative clicks in {time.time() - convert_time:.2f} seconds.")
+
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
+            print(f"Bounding box: {bbox}")
+
+            data_all[j] = crop_and_pad_nd(data, bbox, 0)
+            seg_cropped = crop_and_pad_nd(seg, bbox, -1)
+            if seg_prev is not None:
+                seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)))
+            seg_all[j] = seg_cropped
+
+            pos_clicks_cropped = crop_and_pad_nd(pos_clicks[None], bbox, 0)
+            neg_clicks_cropped = crop_and_pad_nd(neg_clicks[None], bbox, 0)
+            clicks_cropped = np.vstack((pos_clicks_cropped, neg_clicks_cropped))
+            clicks_all[j] = clicks_cropped
+
+        if self.patch_size_was_2d:
+            print("Adjusting for 2D patch size...")
+            data_all = data_all[:, :, 0]
+            seg_all = seg_all[:, :, 0]
+            clicks_all = clicks_all[:, :, 0]
+
+        if self.transforms is not None:
+            print("Applying transforms...")
+            apply_start_time = time.time()
+            with torch.no_grad():
+                with threadpool_limits(limits=1, user_api=None):
+                    data_all = torch.from_numpy(data_all).float()
+                    seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    clicks_all = torch.from_numpy(clicks_all).float()
+                    images = []
+                    segs = []
+                    clicks = []
+                    for b in range(self.batch_size):
+                        print(f"Transforming batch {b}...")
+                        tmp = self.transforms(
+                            **{'image': data_all[b], 'segmentation': seg_all[b], 'regression_target': clicks_all[b]})
+                        images.append(tmp['image'])
+                        segs.append(tmp['segmentation'])
+                        clicks.append(tmp['regression_target'])
+                    data_all = torch.stack(images)
+                    clicks_all = torch.stack(clicks)
+                    if isinstance(segs[0], list):
+                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+                    else:
+                        seg_all = torch.stack(segs)
+                    del segs, images
+
+        data_all = torch.cat((data_all, clicks_all), dim=1)
+        print("Finished combining clicks and image.")
+
+        end_time = time.time()
+        print(f"applying transform completed in {end_time - apply_start_time:.2f} seconds.")
+        print(f"generate_train_batch completed in {end_time - start_time:.2f} seconds.")
+
+        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+
     def generate_train_batch(self):
         selected_keys = self.get_indices()
         # preallocate memory for data and seg
@@ -34,7 +124,7 @@ class nnUNetDataLoaderClicks(nnUNetDataLoader):
             # PROMPT HANDLING
             # Sample a random number of clicks from the click json
 
-            restructured_clicks = self.restructure_clicks(click_json)
+            restructured_clicks = restructure_clicks(click_json)
 
             num_clicks = np.random.randint(0, len(restructured_clicks["points"]) + 1)
             clicks = np.random.choice(restructured_clicks['points'], size=num_clicks, replace=False)
@@ -58,7 +148,7 @@ class nnUNetDataLoaderClicks(nnUNetDataLoader):
             #     neg_clicks = gaussian_filter(neg_clicks, sigma=3)
 
             pos_clicks, neg_clicks = sparse_to_dense_point_gauss(clicks, shape, properties, sigma=3)
-                    
+
             # import napari
             # viewer = napari.Viewer()
             # viewer.add_image(data[0], name='CT')
@@ -131,21 +221,6 @@ class nnUNetDataLoaderClicks(nnUNetDataLoader):
         data_all = torch.cat((data_all, clicks_all), dim=1)
         
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
-
-    def restructure_clicks(self, click_json):
-        """
-        Restructure the clicks to a format that is easier to work with.
-        from {"lesion": [[x,y,z] ,[x,y,z]], "background": [[x,y,z] ,[x,y,z]]}
-        """
-        clicks = {'points': []}
-        for label in click_json:
-            for coords in click_json[label]:
-                if label == 'lesion':
-                    label = 'tumor'
-                singe_point = {'point': coords, 'name': label}
-                clicks["points"].append(singe_point)
-
-        return clicks
 
 # class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
 #     def generate_train_batch_full_img(self):

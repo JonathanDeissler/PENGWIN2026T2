@@ -137,6 +137,20 @@ def sparse_to_dense_point_gauss_timed(points: dict[str, np.ndarray], shape: tupl
     print(f"sparse_to_dense_point_gauss execution time: {end_time - start_time:.4f} seconds")
     return pos_clicks, neg_clicks
 
+def restructure_clicks(click_json):
+    """
+    Restructure the clicks to a format that is easier to work with.
+    from {"lesion": [[x,y,z] ,[x,y,z]], "background": [[x,y,z] ,[x,y,z]]}
+    """
+    clicks = {'points': []}
+    for label in click_json:
+        for coords in click_json[label]:
+            if label == 'lesion':
+                label = 'tumor'
+            singe_point = {'point': coords, 'name': label}
+            clicks["points"].append(singe_point)
+
+    return clicks
 
 def sparse_to_dense_point_gauss(points: dict[str, np.ndarray], shape: tuple[int, ...], properties: dict, sigma: float = 1.0) -> np.ndarray:
     pos_clicks, neg_clicks = np.zeros(shape, dtype=np.float32), np.zeros(shape, dtype=np.float32)
