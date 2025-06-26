@@ -43,7 +43,7 @@ from torch.cuda import device_count
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
-from batchviewer import view_batch
+#from batchviewer import view_batch
 from nnunetv2.training.dataloading.utils import restructure_clicks, sparse_to_dense_point_gauss
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder, evaluate_simple_entry_point
