@@ -9,13 +9,14 @@ from scipy.ndimage import gaussian_filter
 import numpy as np
 from batchgenerators.utilities.file_and_folder_operations import isfile, subfiles
 from nnunetv2.configuration import default_num_processes
-
+from scipy import ndimage
 
 import nibabel as nib
 import cc3d
 import numpy as np
-import cupy as cp
-from cucim.core.operations import morphology
+# from cucim.core.operations import morphology
+from nnunetv2.training.dataloading.nnInteractive_clicks import PointInteraction_stub
+import torch
 
 
 
@@ -186,14 +187,15 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
             labeled_mask = connected_components == label
             labeled_mask = np.array(labeled_mask)
             if use_gpu:
-                # Attempt to compute EDT using GPU
-                edt = morphology.distance_transform_edt(labeled_mask)
+                # not implemented yet error
+                raise NotImplementedError("GPU-based EDT computation is not implemented yet.")
+                # edt = morphology.distance_transform_edt(labeled_mask)
             else:
-                from scipy import ndimage
+
 
                 edt = ndimage.morphology.distance_transform_edt(labeled_mask)
                 edt = np.array(edt)
-                labeled_mask = np.array(labeled_mask)
+                # labeled_mask = np.array(labeled_mask)
 
 
             center = np.unravel_index(np.argmax(edt), edt.shape)
@@ -210,9 +212,10 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
                 labeled_mask = connected_components == label
                 labeled_mask = np.array(labeled_mask)
                 if use_gpu:
-                    edt = morphology.distance_transform_edt(labeled_mask)
+                    #not implemented yet error
+                    raise NotImplementedError("GPU-based EDT computation is not implemented yet.")
+                    # edt = morphology.distance_transform_edt(labeled_mask)
                 else:
-                    from scipy import ndimage
 
                     edt = ndimage.morphology.distance_transform_edt(labeled_mask)
                     edt = np.array(edt)
@@ -335,6 +338,16 @@ def generated_sparse_to_dense_point_gauss(clicks: dict, shape: tuple[int, ...], 
             neg_clicks[*clck] = 1.0
         pos_clicks = gaussian_filter(pos_clicks, sigma=sigma)
         neg_clicks = gaussian_filter(neg_clicks, sigma=sigma)
+    return pos_clicks, neg_clicks
+
+def generated_sparse_to_dense_point_nnInteractive(clicks: dict, shape: tuple[int, ...], sigma: float = 1.0) -> np.ndarray:
+    pos_clicks, neg_clicks = torch.zeros(shape, dtype=torch.float32), torch.zeros(shape, dtype=torch.float32)
+    point_interaction = PointInteraction_stub(point_radius=sigma, use_distance_transform=True)
+    if len(clicks["background"]) > 0:
+        for clck in clicks["lesion"]:
+            pos_clicks = point_interaction.place_point(clck, pos_clicks, binarize=False)
+        for clck in clicks["background"]:
+            neg_clicks = point_interaction.place_point(clck, neg_clicks, binarize=False)
     return pos_clicks, neg_clicks
 
 

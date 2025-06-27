@@ -14,7 +14,7 @@ from acvl_utils.cropping_and_padding.bounding_boxes import crop_and_pad_nd
 
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetBaseDataset
 from nnunetv2.training.dataloading.utils import generated_sparse_to_dense_point_gauss, simulate_clicks, \
-    sparse_to_dense_point_gauss, select_num_points_exp
+    sparse_to_dense_point_gauss, select_num_points_exp, generated_sparse_to_dense_point_nnInteractive
 from nnunetv2.utilities.label_handling.label_handling import LabelManager
 
 
@@ -367,7 +367,7 @@ class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
                 seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)))
             seg_all[j] = seg_cropped
 
-            highest_class_index = 0
+            highest_class_index = 2
 
         if self.patch_size_was_2d:
             data_all = data_all[:, :, 0]
@@ -383,21 +383,31 @@ class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
                     segs = []
                     for b in range(self.batch_size):
                         #split off liver to second channel (label -1)
-                        liver = np.zeros_like(seg_all[b], dtype=np.float32)
-                        liver[seg_all[b] == highest_class_index] = 1  # make sure we only have one class
-                        # append to segall
-                        seg_stacked = torch.from_numpy(np.vstack((seg_all[b], liver)))
-                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_stacked})
+                        # liver = np.zeros_like(seg_all[b], dtype=np.int16)
+                        # liver[seg_all[b] == highest_class_index] = 1  # make sure we only have one class
+                        # # append to segall
+                        #
+                        # import napari
+                        # viewer = napari.Viewer()
+                        # viewer.add_image(data_all[b][0].numpy(), name='CT')
+                        # viewer.add_labels(seg_all[b][0].numpy(), name='segmentation')
+                        # viewer.add_labels(liver, name='liver')
+                        # napari.run()
+                        # seg_stacked = torch.from_numpy(np.vstack((seg_all[b], liver)))
+                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
 
 
 
-                        seg = tmp['segmentation'][0].numpy()
-                        liver = tmp['segmentation'][1].numpy()
+                        seg = tmp['segmentation'].numpy()
+                        liver = np.zeros_like(seg, dtype=np.int16)
+                        liver[seg == highest_class_index] = 1  # make sure we only have one class
+                        lesion = np.zeros_like(seg, dtype=np.int16)
+                        lesion[seg == 1] = 1  # make sure we only have one class
 
                         if np.sum(seg) != 0 and np.sum(liver) == 0:
                             print("lol wat happend here ?")
 
-                        clicks = simulate_clicks(seg, liver, center_offset=3, edge_offset=3)
+                        clicks = simulate_clicks(lesion[0], liver[0], center_offset=3, edge_offset=3)
 
                         #select click amount
                         num_pos_clicks, num_neg_clicks = select_num_points_exp()
@@ -407,7 +417,7 @@ class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
                             clicks["background"] = clicks["background"][:num_neg_clicks]
 
                         # clicks = restructure_clicks(clicks)
-                        pos_clicks, neg_clicks = generated_sparse_to_dense_point_gauss(clicks, liver.shape,
+                        pos_clicks, neg_clicks = generated_sparse_to_dense_point_nnInteractive(clicks, liver[0].shape,
                                                                                        sigma=self.point_width)
 
                         clicks_all = np.concat((pos_clicks[None], neg_clicks[None]), axis=0)

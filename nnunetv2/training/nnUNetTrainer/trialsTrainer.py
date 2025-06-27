@@ -379,7 +379,7 @@ class trialsTrainer(nnUNetTrainer):
                                   sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
                                   probabilistic_oversampling=self.probabilistic_oversampling)
 
-        allowed_num_processes = get_allowed_n_proc_DA()
+        allowed_num_processes =get_allowed_n_proc_DA()
         if allowed_num_processes == 0:
             mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
             mt_gen_val = SingleThreadedAugmenter(dl_val, None)
