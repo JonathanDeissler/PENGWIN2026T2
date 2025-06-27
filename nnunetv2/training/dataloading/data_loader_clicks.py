@@ -367,8 +367,7 @@ class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
                 seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)))
             seg_all[j] = seg_cropped
 
-            unique_classes = np.unique(seg_all)
-            highest_class_index = np.max([np.max(unique_classes),2])
+            highest_class_index = 0
 
         if self.patch_size_was_2d:
             data_all = data_all[:, :, 0]
@@ -378,18 +377,27 @@ class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
             with torch.no_grad():
                 with threadpool_limits(limits=1, user_api=None):
                     data_all = torch.from_numpy(data_all).float()
+
                     seg_all = torch.from_numpy(seg_all).to(torch.int16)
                     images = []
                     segs = []
                     for b in range(self.batch_size):
-                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                        #split off liver to second channel (label -1)
+                        liver = np.zeros_like(seg_all[b], dtype=np.float32)
+                        liver[seg_all[b] == highest_class_index] = 1  # make sure we only have one class
+                        # append to segall
+                        seg_stacked = torch.from_numpy(np.vstack((seg_all[b], liver)))
+                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_stacked})
 
-                        liver = np.zeros_like(tmp['segmentation'][0])
-                        liver[tmp['segmentation'][0].numpy() == highest_class_index] = 1  # make sure we only have one class
 
-                        seg = tmp['segmentation'].numpy()
-                        seg[seg == highest_class_index] = 0  # remove all other classes
-                        clicks = simulate_clicks(seg[0], liver, center_offset=3, edge_offset=3)
+
+                        seg = tmp['segmentation'][0].numpy()
+                        liver = tmp['segmentation'][1].numpy()
+
+                        if np.sum(seg) != 0 and np.sum(liver) == 0:
+                            print("lol wat happend here ?")
+
+                        clicks = simulate_clicks(seg, liver, center_offset=3, edge_offset=3)
 
                         #select click amount
                         num_pos_clicks, num_neg_clicks = select_num_points_exp()
