@@ -44,7 +44,8 @@ from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from batchviewer import view_batch
-from nnunetv2.training.dataloading.utils import restructure_clicks, sparse_to_dense_point_gauss
+from nnunetv2.training.dataloading.utils import restructure_clicks, sparse_to_dense_point_gauss, \
+    generated_sparse_to_dense_point_nnInteractive, sparse_to_dense_point_nnInteractive
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder, evaluate_simple_entry_point
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
@@ -379,7 +380,7 @@ class trialsTrainer(nnUNetTrainer):
                                   sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
                                   probabilistic_oversampling=self.probabilistic_oversampling)
 
-        allowed_num_processes =get_allowed_n_proc_DA()
+        allowed_num_processes = get_allowed_n_proc_DA()
         if allowed_num_processes == 0:
             mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
             mt_gen_val = SingleThreadedAugmenter(dl_val, None)
@@ -661,6 +662,7 @@ class trialsTrainerClickGen(nnUNetTrainer):
         self.num_epochs = 1000
         self.initial_lr = 1e-3
         self.enable_deep_supervision = False
+        self.point_width =1.5
 
     def _build_loss(self):
         # set smooth to 0
@@ -776,14 +778,14 @@ class trialsTrainerClickGen(nnUNetTrainer):
                                        self.label_manager,
                                        oversample_foreground_percent=self.oversample_foreground_percent,
                                        sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
-                                       probabilistic_oversampling=self.probabilistic_oversampling)
+                                       probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width)
         dl_val = nnUNetDataLoaderClicksGenerated(dataset_val, self.batch_size,
                                         self.configuration_manager.patch_size,
                                         self.configuration_manager.patch_size,
                                         self.label_manager,
                                         oversample_foreground_percent=self.oversample_foreground_percent,
                                         sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
-                                        probabilistic_oversampling=self.probabilistic_oversampling)
+                                        probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width)
 
         allowed_num_processes = get_allowed_n_proc_DA()
         if allowed_num_processes == 0:
@@ -834,6 +836,20 @@ class trialsTrainerClickGen(nnUNetTrainer):
             output = self.network(data, )
             # del data
             l = self.loss(output, target)
+            # import napari
+            # viewer = napari.Viewer()
+            #
+            # viewer.add_image(data[1][0].detach().cpu().numpy(), name='CT')
+            # viewer.add_labels(target[1][0].detach().cpu().numpy(), name='segmentation')
+            # viewer.add_image(data[1][1].detach().cpu().numpy(), name='positive clicks da')
+            # viewer.add_image(data[1][2].detach().cpu().numpy(), name='negative clicks da')
+            # output_converted = torch.softmax(output[1], 0).detach().cpu().numpy()
+            # viewer.add_image(output_converted[0], name='output_background')
+            # viewer.add_image(output_converted[1], name='output_tumor')
+            # viewer.add_image(output_converted[2], name='output_liver')
+            # # viewer.add_image(torch.softmax(output[0][1],0).detach().cpu().numpy(), name='output_tumor')
+            # # viewer.add_image(torch.softmax(output[0][1],0).detach().cpu().numpy(), name='output_liver')
+            # napari.run()
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()
@@ -986,19 +1002,29 @@ class trialsTrainerClickGen(nnUNetTrainer):
                     data, seg, seg_org, properties, clicks = dataset_val.load_case_with_clicks(k)
                     shape = data.shape[1:]
 
+
+
                     if use_clicks:
                         clicks = restructure_clicks(clicks)
-                        pos_clicks, neg_clicks = sparse_to_dense_point_gauss(clicks["points"], shape, properties,
-                                                                             sigma=3)
+                        pos_clicks, neg_clicks = sparse_to_dense_point_nnInteractive(clicks["points"], shape,properties,
+                                                                             sigma=self.point_width)
 
                     else:
                         pos_clicks = np.zeros(shape, dtype=np.float32)
                         neg_clicks = np.zeros(shape, dtype=np.float32)
 
+
                     clicks_stacked = np.vstack((np.expand_dims(pos_clicks, axis=0), np.expand_dims(neg_clicks, axis=0)))
                     clicks_stacked = torch.from_numpy(clicks_stacked).float()
                     data = torch.from_numpy(np.asarray(data)).float()
                     data = torch.cat((data, clicks_stacked), dim=0)
+
+                    # import napari
+                    # viewer = napari.Viewer()
+                    # viewer.add_image(data[0].numpy(), name='CT')
+                    # viewer.add_image(data[1], name='pos')
+                    # viewer.add_image(data[2], name='neg')
+                    # napari.run()
 
                     if self.is_cascaded:
                         data = np.vstack(
@@ -1066,3 +1092,15 @@ class trialsTrainer1ep(trialsTrainer):
         self.num_epochs = 1
         self.initial_lr = 1e-3
         self.enable_deep_supervision = False
+
+class trialsTrainerClickGenPW3(trialsTrainerClickGen):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.point_width = 3
+
+class trialsTrainerClickGenPW2(trialsTrainerClickGen):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.point_width = 2

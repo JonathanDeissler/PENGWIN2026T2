@@ -419,6 +419,14 @@ class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
                         # clicks = restructure_clicks(clicks)
                         pos_clicks, neg_clicks = generated_sparse_to_dense_point_nnInteractive(clicks, liver[0].shape,
                                                                                        sigma=self.point_width)
+                        # import napari
+                        # viewer = napari.Viewer()
+                        # viewer.add_image(tmp['image'], name='CT')
+                        # viewer.add_labels(liver, name='liver')
+                        # viewer.add_labels(lesion, name='lesion')
+                        # viewer.add_image(pos_clicks, name='positive clicks')
+                        # viewer.add_image(neg_clicks, name='negative clicks')
+                        # napari.run()
 
                         clicks_all = np.concat((pos_clicks[None], neg_clicks[None]), axis=0)
                         # clicks_arr.append(torch.from_numpy(clicks_all).float())
@@ -447,13 +455,11 @@ class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
 
         # import napari
         # viewer = napari.Viewer()
-        # viewer.add_image(data[0], name='CT original')
-        # viewer.add_image(data[1], name='PET original')
+        # # viewer.add_image(data[0], name='CT original')
         # viewer.add_image(data_all[1][0].numpy(), name='CT')
-        # viewer.add_image(data_all[1][1].numpy(), name='PET')
-        # viewer.add_labels(seg_all[0][1,0].numpy(), name='segmentation')
-        # viewer.add_image(data_all[1][2].numpy(), name='positive clicks da')
-        # viewer.add_image(data_all[1][3].numpy(), name='negative clicks da')
+        # viewer.add_labels(seg_all[1][0].numpy(), name='segmentation')
+        # viewer.add_image(data_all[1][1].numpy(), name='positive clicks da')
+        # viewer.add_image(data_all[1][2].numpy(), name='negative clicks da')
         # napari.run()
 
         # check if more then 1 nonzero value is in the segs if so remove it

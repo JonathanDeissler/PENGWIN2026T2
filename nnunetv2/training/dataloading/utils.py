@@ -99,9 +99,9 @@ def preprocess_point(point, data_properties, shape):
 
         # Adjust for resampling
         factor = [shape[i] / shape_after_cropping_and_before_resampling[i] for i in range(3)]
-        x = np.round(x * factor[2]).astype(np.uint16)
-        y = np.round(y * factor[1]).astype(np.uint16)
-        z = np.round(z * factor[0]).astype(np.uint16)
+        x = np.round(x * factor[2]).astype(np.int16)
+        y = np.round(y * factor[1]).astype(np.int16)
+        z = np.round(z * factor[0]).astype(np.int16)
         return [z, y, x]
 
 # Experimental speedup tech
@@ -350,6 +350,21 @@ def generated_sparse_to_dense_point_nnInteractive(clicks: dict, shape: tuple[int
             neg_clicks = point_interaction.place_point(clck, neg_clicks, binarize=False)
     return pos_clicks, neg_clicks
 
+def sparse_to_dense_point_nnInteractive(points: dict[str, np.ndarray], shape: tuple[int, ...], properties: dict, sigma: float = 1.0) -> np.ndarray:
+    pos_clicks, neg_clicks = torch.zeros(shape, dtype=torch.float32), torch.zeros(shape, dtype=torch.float32)
+    point_interaction = PointInteraction_stub(point_radius=sigma, use_distance_transform=True)
+    if len(points) > 0:
+        for clck in points:
+            coord = clck['point']
+            label = clck['name']
+            coord = preprocess_point(coord, properties, shape)
+            if label == 'tumor':
+                pos_clicks = point_interaction.place_point(coord, pos_clicks, binarize=False)
+            elif label == 'background':
+                neg_clicks = point_interaction.place_point(coord, neg_clicks, binarize=False)
+            else:
+                raise ValueError(f"Unknown label {label} in click json")
+    return pos_clicks, neg_clicks
 
 
 if __name__ == '__main__':
