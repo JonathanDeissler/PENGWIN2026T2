@@ -174,7 +174,8 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
 
 
     if np.sum(label_im) == 0:
-        print("[WARNING] GT is empty, generating background clicks only!")
+        pass
+        # print("[WARNING] GT is empty, generating background clicks only!")
     else:
         ##### Tumor Clicks #####
         connected_components = cc3d.connected_components(label_im, connectivity=26)
@@ -239,7 +240,7 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
     ##### Background Clicks #####
     in_liver = input_liver
     if np.sum(in_liver) == 0:
-        print("[WARNING] Liver mask is empty no bg clicks")
+        # print("[WARNING] Liver mask is empty no bg clicks")
         clicks['background'] = []
     else:
         bg_clicks = uniform_sample_coordinates(in_liver, label_im) # sample non-tumor clicks in the liver
