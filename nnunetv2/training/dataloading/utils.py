@@ -11,6 +11,7 @@ from batchgenerators.utilities.file_and_folder_operations import isfile, subfile
 from nnunetv2.configuration import default_num_processes
 from scipy import ndimage
 
+import edt as fastedt
 import nibabel as nib
 import cc3d
 import numpy as np
@@ -193,11 +194,7 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
                 # edt = morphology.distance_transform_edt(labeled_mask)
             else:
 
-
-                edt = ndimage.morphology.distance_transform_edt(labeled_mask)
-                edt = np.array(edt)
-                # labeled_mask = np.array(labeled_mask)
-
+                edt = fastedt.edt(labeled_mask)
 
             center = np.unravel_index(np.argmax(edt), edt.shape)
             if center_offset is not None:
@@ -217,10 +214,14 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
                     raise NotImplementedError("GPU-based EDT computation is not implemented yet.")
                     # edt = morphology.distance_transform_edt(labeled_mask)
                 else:
-
-                    edt = ndimage.morphology.distance_transform_edt(labeled_mask)
-                    edt = np.array(edt)
-                    labeled_mask = np.array(labeled_mask)
+                    edt = fastedt.edt(labeled_mask)
+                    edt_inverted = (np.max(edt) - edt) * (edt > 0)
+                    # boundary_elements = (edt_inverted == np.max(edt_inverted)) * (labeled_mask > 0)
+                    # indices = np.array(np.nonzero(boundary_elements)).T  # Shape: (num_true, ndim)
+                    #
+                    # edt = ndimage.morphology.distance_transform_edt(labeled_mask)
+                    # edt = np.array(edt)
+                    # labeled_mask = np.array(labeled_mask)
                 edt_inverted = (np.max(edt) - edt) * (edt > 0)
                 boundary_elements = (edt_inverted == np.max(edt_inverted)) * (labeled_mask > 0)
                 indices = np.array(np.nonzero(boundary_elements)).T  # Shape: (num_true, ndim)
