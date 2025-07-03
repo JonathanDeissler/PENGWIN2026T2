@@ -330,10 +330,76 @@ class nnUNetDatasetBlosc2(nnUNetBaseDataset):
         # print(image_size, chunk_size, block_size)
         return tuple(block_size), tuple(chunk_size)
 
+class nnUNetDatasetHelperSeg(nnUNetDatasetBlosc2):
+    """
+    This is a helper class for nnUNetDatasetBlosc2 that allows you add an additional helper seg
+    """
+
+    def __init__(self, folder: str,  identifiers: List[str] = None,
+                 folder_with_segs_from_previous_stage: str = None):
+        super().__init__(folder, identifiers, folder_with_segs_from_previous_stage)
+
+
+
+
+    def save_case_helper(
+            data: np.ndarray,
+            seg: np.ndarray,
+            org: np.ndarray,
+            properties: dict,
+            output_filename_truncated: str,
+            chunks=None,
+            blocks=None,
+            chunks_seg=None,
+            blocks_seg=None,
+            chunks_helper_seg=None,
+            blocks_helper_seg=None,
+            clevel: int = 8,
+            codec=blosc2.Codec.ZSTD
+    ):
+        blosc2.set_nthreads(1)
+        if chunks_seg is None:
+            chunks_seg = chunks
+        if blocks_seg is None:
+            blocks_seg = blocks
+
+        cparams = {
+            'codec': codec,
+            # 'filters': [blosc2.Filter.SHUFFLE],
+            # 'splitmode': blosc2.SplitMode.ALWAYS_SPLIT,
+            'clevel': clevel,
+        }
+        # print(output_filename_truncated, data.shape, seg.shape, blocks, chunks, blocks_seg, chunks_seg, data.dtype, seg.dtype)
+        blosc2.asarray(np.ascontiguousarray(data), urlpath=output_filename_truncated + '.b2nd', chunks=chunks,
+                       blocks=blocks, cparams=cparams, mmap_mode='w+')
+        blosc2.asarray(np.ascontiguousarray(seg), urlpath=output_filename_truncated + '_seg.b2nd', chunks=chunks_seg,
+                       blocks=blocks_seg, cparams=cparams, mmap_mode='w+')
+        blosc2.asarray(np.ascontiguousarray(org), urlpath=output_filename_truncated + '_helper_seg.b2nd',
+                       chunks=chunks_helper_seg, blocks=blocks_helper_seg, cparams=cparams, mmap_mode='w+')
+        write_pickle(properties, output_filename_truncated + '.pkl')
+
+
+
+    def load_case_helper(self, identifier):
+        dparams = {
+            'nthreads': 1
+        }
+        data_b2nd_file = join(self.source_folder, identifier + '.b2nd')
+        data = blosc2.open(urlpath=data_b2nd_file, mode='r', dparams=dparams, mmap_mode='r')
+
+        seg_b2nd_file = join(self.source_folder, identifier + '_seg.b2nd')
+        seg = blosc2.open(urlpath=seg_b2nd_file, mode='r', dparams=dparams, mmap_mode='r')
+
+        helper_seg_b2nd_file = join(self.source_folder, identifier + '_helper_seg.b2nd')
+        helper_seg = blosc2.open(urlpath=helper_seg_b2nd_file, mode='r', dparams=dparams, mmap_mode='r')
+
+
+        properties = load_pickle(join(self.source_folder, identifier + '.pkl'))
+        return data, seg, None, helper_seg, properties
 
 file_ending_dataset_mapping = {
     'npz': nnUNetDatasetNumpy,
-    'b2nd': nnUNetDatasetBlosc2
+    'b2nd': nnUNetDatasetHelperSeg
 }
 
 
