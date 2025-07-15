@@ -624,27 +624,48 @@ def compute_segmentation_scores(prediction_mask, reference_mask,
 def process_case(prediction_path_and_ref_dir):
     prediction_path, ref_dir, output_dir = prediction_path_and_ref_dir
 
-    try:
-        # Find matching reference path
-        base_id = '_'.join(os.path.basename(prediction_path).split('_')[:-1])
-        reference_path = os.path.join(ref_dir, base_id + '.nii.gz')
-        # Load NIfTI files
-        pred_nii = nib.load(prediction_path)
-        ref_nii = nib.load(reference_path)
+    # try:
+    #     # Find matching reference path
+    #     base_id = '_'.join(os.path.basename(prediction_path).split('_')[:-1])
+    #     reference_path = os.path.join(ref_dir, base_id + '.nii.gz')
+    #     # Load NIfTI files
+    #     pred_nii = nib.load(prediction_path)
+    #     ref_nii = nib.load(reference_path)
+    #
+    #     prediction_mask = pred_nii.get_fdata()
+    #     reference_mask = ref_nii.get_fdata()
+    #     voxel_spacing = pred_nii.header.get_zooms()
+    #
+    #     # Compute metrics
+    #     scores = compute_segmentation_scores(prediction_mask, reference_mask, voxel_spacing)
+    #
+    #     # Output path
+    #     os.makedirs(output_dir, exist_ok=True)
+    #     base_filename = os.path.basename(prediction_path).replace('.nii.gz', '.json')
+    #     output_path = os.path.join(output_dir, base_filename)
+    #     # Save JSON
+    #     with open(output_path, 'w') as f:
+    #         json.dump(scores, f, indent=2)
+    # except Exception as e:
+    #     print(f"[✗] Failed: {prediction_path} — {e}")
 
-        prediction_mask = pred_nii.get_fdata()
-        reference_mask = ref_nii.get_fdata()
-        voxel_spacing = pred_nii.header.get_zooms()
+    base_id = '_'.join(os.path.basename(prediction_path).split('_')[:-1])
+    reference_path = os.path.join(ref_dir, base_id + '.nii.gz')
+    # Load NIfTI files
+    pred_nii = nib.load(prediction_path)
+    ref_nii = nib.load(reference_path)
 
-        # Compute metrics
-        scores = compute_segmentation_scores(prediction_mask, reference_mask, voxel_spacing)
+    prediction_mask = pred_nii.get_fdata()
+    reference_mask = ref_nii.get_fdata()
+    voxel_spacing = pred_nii.header.get_zooms()
 
-        # Output path
-        os.makedirs(output_dir, exist_ok=True)
-        base_filename = os.path.basename(prediction_path).replace('.nii.gz', '.json')
-        output_path = os.path.join(output_dir, base_filename)
-        # Save JSON
-        with open(output_path, 'w') as f:
-            json.dump(scores, f, indent=2)
-    except Exception as e:
-        print(f"[✗] Failed: {prediction_path} — {e}")
+    # Compute metrics
+    scores = compute_segmentation_scores(prediction_mask, reference_mask, voxel_spacing)
+
+    # Output path
+    os.makedirs(output_dir, exist_ok=True)
+    base_filename = os.path.basename(prediction_path).replace('.nii.gz', '.json')
+    output_path = os.path.join(output_dir, base_filename)
+    # Save JSON
+    with open(output_path, 'w') as f:
+        json.dump(scores, f, indent=2)

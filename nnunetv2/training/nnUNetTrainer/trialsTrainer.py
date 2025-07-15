@@ -1143,7 +1143,7 @@ class trialsTrainerClickGen(nnUNetTrainer):
                                                       folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
                                                       )
 
-
+                    continue
                     results = []
                     for i, k in enumerate(dataset_val.get_dataset_identifiers()):
                         proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
