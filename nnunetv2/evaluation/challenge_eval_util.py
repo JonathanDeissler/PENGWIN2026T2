@@ -584,7 +584,12 @@ def compute_segmentation_scores(prediction_mask, reference_mask,
         # Limit processing to the bounding box containing both the prediction
         # and reference objects.
         target_mask = (reference_mask==obj_id)+(prediction_mask==obj_id)
-        bounding_box = ndimage.find_objects(target_mask)[0]
+        if np.issubdtype(target_mask.dtype, np.bool_) or target_mask.dtype == bool:
+            labeled_mask, _ = ndimage.label(target_mask)
+        else:
+            labeled_mask = target_mask  # assume already labeled
+
+        bounding_box = ndimage.find_objects(labeled_mask)[0]
         p = (prediction_mask==obj_id)[bounding_box]
         r = (reference_mask==obj_id)[bounding_box]
         if np.any(p) and np.any(r):
