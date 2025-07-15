@@ -43,7 +43,12 @@ from torch.cuda import device_count
 from torch.cuda.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+
 from batchviewer import view_batch
+from tqdm import tqdm
+import json
+import csv
+from nnunetv2.evaluation.challenge_eval_util import process_case, group_jsons_by_prefix, aggregate_group_metrics
 from nnunetv2.training.dataloading.utils import restructure_clicks, sparse_to_dense_point_gauss, \
     generated_sparse_to_dense_point_nnInteractive, sparse_to_dense_point_nnInteractive
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
@@ -515,6 +520,7 @@ class trialsTrainer(nnUNetTrainer):
 
     def perform_actual_validation(self, save_probabilities: bool = False):
         for i in range (2):
+
             if i == 0:
                 print("performing val without clicks")
                 use_clicks = False
@@ -933,9 +939,10 @@ class trialsTrainerClickGen(nnUNetTrainer):
 
         return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
 
-    def perform_actual_validation(self, save_probabilities: bool = False):
+    def perform_actual_validation_old(self, save_probabilities: bool = False):
         for i in range(2):
             if i == 0:
+                continue
                 print("performing val without clicks")
                 use_clicks = False
             else:
@@ -1085,6 +1092,264 @@ class trialsTrainerClickGen(nnUNetTrainer):
             self.set_deep_supervision_enabled(True)
             compute_gaussian.cache_clear()
 
+    def perform_actual_validation(self, save_probabilities: bool = False):
+            for num_clicks in [0,3,7,10]:
+
+                if num_clicks == 0:
+                    print("performing val without clicks")
+                    use_clicks = False
+                else:
+                    print("performing val with clicks")
+                    use_clicks = True
+
+                self.set_deep_supervision_enabled(False)
+                self.network.eval()
+
+                if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
+                    self.print_to_log_file("WARNING! batch size is 1 during training and torch.compile is enabled. If you "
+                                           "encounter crashes in validation then this is because torch.compile forgets "
+                                           "to trigger a recompilation of the model with deep supervision disabled. "
+                                           "This causes torch.flip to complain about getting a tuple as input. Just rerun the "
+                                           "validation with --val (exactly the same as before) and then it will work. "
+                                           "Why? Because --val triggers nnU-Net to ONLY run validation meaning that the first "
+                                           "forward pass (where compile is triggered) already has deep supervision disabled. "
+                                           "This is exactly what we need in perform_actual_validation")
+
+                predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+                                            perform_everything_on_device=True, device=self.device, verbose=False,
+                                            verbose_preprocessing=False, allow_tqdm=False)
+                predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
+                                                self.dataset_json, self.__class__.__name__,
+                                                self.inference_allowed_mirroring_axes)
+
+                with multiprocessing.get_context("spawn").Pool(default_num_processes) as segmentation_export_pool:
+                    worker_list = [i for i in segmentation_export_pool._pool]
+
+                    validation_output_folder = join(self.output_folder, 'validation')
+
+                    maybe_mkdir_p(validation_output_folder)
+
+                    # we cannot use self.get_tr_and_val_datasets() here because we might be DDP and then we have to distribute
+                    # the validation keys across the workers.
+                    _, val_keys = self.do_split()
+                    if self.is_ddp:
+                        last_barrier_at_idx = len(val_keys) // dist.get_world_size() - 1
+
+                        val_keys = val_keys[self.local_rank:: dist.get_world_size()]
+                        # we cannot just have barriers all over the place because the number of keys each GPU receives can be
+                        # different
+
+                    dataset_val = nnUNetDatasetBlosc2(self.preprocessed_dataset_folder, val_keys,
+                                                      folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
+                                                      )
+
+
+                    results = []
+                    for i, k in enumerate(dataset_val.get_dataset_identifiers()):
+                        proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
+                                                                   allowed_num_queued=2)
+                        while not proceed:
+                            sleep(0.1)
+                            proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
+                                                                       allowed_num_queued=2)
+                        maybe_mkdir_p(join(validation_output_folder, k))
+                        self.print_to_log_file(f"predicting {k}")
+                        data, seg, seg_org, properties, clicks = dataset_val.load_case_with_clicks(k)
+                        shape = data.shape[1:]
+
+
+
+                        if use_clicks:
+                            # select num_clicks random clicks
+                            selected_clicks = {'background': [], 'lesion': []}
+                            if clicks is not None and len(clicks["lesion"]) >= num_clicks:
+                                selected_clicks["lesion"] = clicks["lesion"][:num_clicks]
+                            if clicks is not None and len(clicks["background"]) >= num_clicks:
+                                selected_clicks["background"] = clicks["background"][:num_clicks]
+
+                            clicks = restructure_clicks(selected_clicks)
+
+
+
+                            pos_clicks, neg_clicks = sparse_to_dense_point_nnInteractive(clicks["points"], shape,properties,
+                                                                                 sigma=self.point_width)
+
+                        else:
+                            pos_clicks = np.zeros(shape, dtype=np.float32)
+                            neg_clicks = np.zeros(shape, dtype=np.float32)
+
+
+                        clicks_stacked = np.vstack((np.expand_dims(pos_clicks, axis=0), np.expand_dims(neg_clicks, axis=0)))
+                        clicks_stacked = torch.from_numpy(clicks_stacked).float()
+                        data = torch.from_numpy(np.asarray(data)).float()
+                        data = torch.cat((data, clicks_stacked), dim=0)
+
+                        # import napari
+                        # viewer = napari.Viewer()
+                        # viewer.add_image(data[0].numpy(), name='CT')
+                        # viewer.add_image(data[1], name='pos')
+                        # viewer.add_image(data[2], name='neg')
+                        # napari.run()
+
+                        if self.is_cascaded:
+                            data = np.vstack(
+                                (data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels,
+                                                                   output_dtype=data.dtype)))
+                        with warnings.catch_warnings():
+                            # ignore 'The given NumPy array is not writable' warning
+                            warnings.simplefilter("ignore")
+                            if type(data) is torch.Tensor:
+                                pass
+                            else:
+                                data = torch.from_numpy(data)
+
+                        self.print_to_log_file(f'{k}, shape {data.shape}, rank {self.local_rank}')
+
+                        #augment filename given num clicks
+                        k_clicks = f"{k}_{num_clicks}"
+                        output_filename_truncated = join(validation_output_folder,k, k_clicks)
+
+                        prediction = predictor.predict_sliding_window_return_logits(data)
+                        prediction = prediction.cpu()
+
+                        # this needs to go into background processes
+                        results.append(
+                            segmentation_export_pool.starmap_async(
+                                export_prediction_from_logits, (
+                                    (prediction, properties, self.configuration_manager, self.plans_manager,
+                                     self.dataset_json, output_filename_truncated, save_probabilities),
+                                )
+                            )
+                        )
+                        # for debug purposes
+                        # export_prediction(prediction_for_export, properties, self.configuration, self.plans, self.dataset_json,
+                        #              output_filename_truncated, save_probabilities)
+
+                        # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
+                        if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
+                            dist.barrier()
+
+                    _ = [r.get() for r in results]
+
+                if self.is_ddp:
+                    dist.barrier()
+
+            if self.local_rank == 0:
+
+                # predicted_masks_path = sys.argv[2]
+                groundtruth_masks_path = join(self.preprocessed_dataset_folder_base, 'gt_segmentations')
+                metrics_csv_path = join(self.output_folder, 'metrics_csv')
+
+                os.makedirs(metrics_csv_path, exist_ok=True)
+
+                cases_csv_path = os.path.join(metrics_csv_path, "per_case_metrics.csv")
+                full_csv_path = os.path.join(metrics_csv_path, "metrics.csv")
+
+                predicted_cases = os.listdir(validation_output_folder)
+                print(f"{len(predicted_cases)} predicted cases!")
+
+
+                orders = [os.path.splitext(os.path.basename(f))[0] for f in predicted_cases]
+
+                with open(cases_csv_path, mode='w', newline='') as writer_file:
+                    writer = csv.writer(writer_file)
+
+                    writer.writerow(
+                        ["Image_gt", "Image_pm", "DSC@AUC", "ASD@AUC", "MSD@AUC", "DSC@Final", "ASD@Final",
+                         "MSD@Final"])  # write header row
+
+                    for i, predicted_case in enumerate(os.listdir(validation_output_folder)):
+                        image_hash = orders[i]
+                        predicted_case = os.path.join(validation_output_folder, predicted_case)
+                        prediction_paths = [
+                            os.path.join(predicted_case, f)
+                            for f in os.listdir(predicted_case)
+                            if f.endswith('.nii.gz')
+                        ]
+
+                        output_dir = os.path.join(metrics_csv_path, 'val_metrics')
+
+                        # Bundle paths into a list of tuples
+                        input_data = [(path, groundtruth_masks_path, output_dir) for path in
+                                      sorted(prediction_paths)]
+
+                        for case in tqdm(input_data, desc=f'Evaluating case {os.path.basename(predicted_case)}'):
+                            process_case(case)
+
+                        grouped_jsons = group_jsons_by_prefix(output_dir, os.path.basename(predicted_case))
+                        output_path = output_dir.replace('val_metrics', 'interactive_metrics')
+                        os.makedirs(output_path, exist_ok=True)
+                        print(f'\n  Case: {os.path.basename(predicted_case)} ({len(grouped_jsons)} files)')
+                        # assert len(grouped_jsons) == 11
+                        agg = aggregate_group_metrics(grouped_jsons)
+                        output_json = os.path.join(output_path, f'{os.path.basename(predicted_case)}.json')
+                        with open(output_json, 'w') as f:
+                            json.dump(agg, f, indent=2)
+                        gt_name = f"{image_hash}"
+                        pm_name = f"pred-{image_hash}"
+                        # Iterate through each image name and write the corresponding dice scores
+                        writer.writerow(
+                            [gt_name, pm_name, agg['dice']['AUC'], agg['assd']['AUC'], agg['msd']['AUC'],
+                             agg['dice']['Final'], agg['assd']['Final'], agg['msd']['Final']])
+                        print(f"[✓] Saved: {output_json}")
+
+                final_metric_jsons = [os.path.join(output_path, f) for f in os.listdir(output_path)]
+                assert len(final_metric_jsons) == len(predicted_cases)
+                mean_metrics = {
+                    "dice": {
+                        "AUC": 0,
+                        "Final": 0,
+                    },
+                    "assd": {
+                        "AUC": 0,
+                        "Final": 0
+                    },
+                    "msd": {
+                        "AUC": 0,
+                        "Final": 0
+                    }
+                }
+                for final_metric_json in final_metric_jsons:
+                    with open(final_metric_json, 'r') as f:
+                        final_metric = json.load(f)
+                        for key in mean_metrics:
+                            for subkey in mean_metrics[key]:
+                                mean_metrics[key][subkey] += final_metric[key][subkey]
+
+                # Now average
+                num_files = len(final_metric_jsons)
+                for key in mean_metrics:
+                    for subkey in mean_metrics[key]:
+                        mean_metrics[key][subkey] /= num_files
+
+                final_json = os.path.join(metrics_csv_path, 'final_interactive_metrics.json')
+                with open(final_json, 'w') as f:
+                    json.dump(mean_metrics, f, indent=2)
+
+                # Open the CSV file for writing
+                with open(full_csv_path, mode='w', newline='') as file:
+                    # Create a CSV writer object
+                    writer = csv.writer(file)
+                    # Write the headers
+                    writer.writerow(['Metric', 'Value'])
+                    # Write the metrics
+                    writer.writerow(
+                        [f"DSC@AUC", mean_metrics['dice']['AUC']])  # Writing the value directly without formatting
+                    writer.writerow(
+                        [f"ASD@AUC", mean_metrics['assd']['AUC']])  # Writing the value directly without formatting
+                    writer.writerow(
+                        [f"MSD@AUC", mean_metrics['msd']['AUC']])  # Writing the value directly without formatting
+                    writer.writerow([f"DSC@Final", mean_metrics['dice'][
+                        'Final']])  # Writing the value directly without formatting
+                    writer.writerow([f"ASD@Final", mean_metrics['assd'][
+                        'Final']])  # Writing the value directly without formatting
+                    writer.writerow([f"MSD@Final",
+                                     mean_metrics['msd']['Final']])  # Writing the value directly without formatting
+
+                print(f"[✓] Saved: {final_json}")
+
+            self.set_deep_supervision_enabled(True)
+            compute_gaussian.cache_clear()
 
 class trialsTrainer1ep(trialsTrainer):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,

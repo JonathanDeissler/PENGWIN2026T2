@@ -396,8 +396,6 @@ class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
                         # seg_stacked = torch.from_numpy(np.vstack((seg_all[b], liver)))
                         tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
 
-
-
                         seg = tmp['segmentation'].numpy()
                         liver = np.zeros_like(seg, dtype=np.int16)
                         liver[seg == highest_class_index] = 1  # make sure we only have one class

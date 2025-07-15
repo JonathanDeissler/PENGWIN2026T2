@@ -21,8 +21,8 @@ def get_allowed_n_proc_DA():
         use_this = int(os.environ['nnUNet_n_proc_DA'])
     else:
         hostname = subprocess.getoutput(['hostname'])
-        if hostname in ['Fabian', ]:
-            use_this = 12
+        if hostname in ['Fabian', 'e230-pc012.inet.dkfz-heidelberg.de']:
+            use_this = 8
         elif hostname in ['hdf19-gpu16', 'hdf19-gpu17', 'hdf19-gpu18', 'hdf19-gpu19', 'e230-AMDworkstation']:
             use_this = 16
         elif hostname.startswith('e230-dgx1'):
@@ -38,7 +38,7 @@ def get_allowed_n_proc_DA():
         elif hostname.startswith('hdf19-gpu') or hostname.startswith('e071-gpu'):
             use_this = 12
         else:
-            use_this = 12  # default value
+            use_this =12
 
     use_this = min(use_this, os.cpu_count())
     return use_this

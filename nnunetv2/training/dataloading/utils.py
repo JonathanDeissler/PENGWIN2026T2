@@ -21,6 +21,9 @@ import torch
 
 
 
+
+
+
 def _convert_to_npy(npz_file: str, unpack_segmentation: bool = True, overwrite_existing: bool = False,
                     verify_npy: bool = False, fail_ctr: int = 0) -> None:
     data_npy = npz_file[:-3] + "npy"
@@ -367,6 +370,7 @@ def sparse_to_dense_point_nnInteractive(points: dict[str, np.ndarray], shape: tu
             else:
                 raise ValueError(f"Unknown label {label} in click json")
     return pos_clicks, neg_clicks
+
 
 
 if __name__ == '__main__':
