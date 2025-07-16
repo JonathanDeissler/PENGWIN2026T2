@@ -78,6 +78,8 @@ from nnunetv2.utilities.label_handling.label_handling import convert_labelmap_to
 from nnunetv2.utilities.plans_handling.plans_handler import PlansManager
 
 from nnunetv2.training.nnUNetTrainer.nnUNetTrainer import nnUNetTrainer
+from torch.optim.lr_scheduler import SequentialLR, LinearLR
+from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler  # nnU-Net's PolyLR
 
 
 class trialsTrainer(nnUNetTrainer):
@@ -1143,7 +1145,6 @@ class trialsTrainerClickGen(nnUNetTrainer):
                                                       folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
                                                       )
 
-                    continue
                     results = []
                     for i, k in enumerate(dataset_val.get_dataset_identifiers()):
                         proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
@@ -1462,3 +1463,28 @@ class trialsTrainerClickGenRemLastClass(trialsTrainerClickGen):
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
 
+
+class trialsTrainerClickGenOnlyTumorLRWarmup(trialsTrainerClickGenRemLastClass):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr,
+                                    weight_decay=self.weight_decay,
+                                    momentum=0.99, nesterov=True)
+
+        warmup_epochs = 50
+
+        # Warmup scheduler (linear increase from 0 to initial_lr over warmup_epochs)
+        warmup_scheduler = LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs)
+
+        # Main scheduler: PolyLR for the remaining epochs
+        main_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs - warmup_epochs)
+
+        # Combine schedulers
+        lr_scheduler = SequentialLR(optimizer,
+                                    schedulers=[warmup_scheduler, main_scheduler],
+                                    milestones=[warmup_epochs])
+
+        return optimizer, lr_scheduler
