@@ -67,7 +67,7 @@ from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
-from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler
+from nnunetv2.training.lr_scheduler.polylr import PolyLRScheduler, PytorchCompliantPolyLRScheduler
 from nnunetv2.utilities.collate_outputs import collate_outputs
 from nnunetv2.utilities.crossval_split import generate_crossval_split
 from nnunetv2.utilities.default_n_proc_DA import get_allowed_n_proc_DA
@@ -1475,20 +1475,32 @@ class trialsTrainerClickGenOnlyTumorLRWarmup(trialsTrainerClickGenRemLastClass):
                                     momentum=0.99, nesterov=True)
 
         warmup_epochs = 50
+        total_epochs = self.num_epochs
 
-        # Warmup scheduler (linear increase from 0 to initial_lr over warmup_epochs)
-        warmup_scheduler = LinearLR(optimizer, start_factor=1e-3, end_factor=1.0, total_iters=warmup_epochs)
+        # Warmup: linear LR from 1e-3 * lr → lr over warmup_epochs
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=1e-3,
+            end_factor=1.0,
+            total_iters=warmup_epochs
+        )
 
-        # Main scheduler: PolyLR for the remaining epochs
-        main_scheduler = PolyLRScheduler(optimizer, self.initial_lr, self.num_epochs - warmup_epochs)
+        # PolyLR: decay after warmup_epochs
+        main_scheduler = PytorchCompliantPolyLRScheduler(
+            optimizer,
+            initial_lr=self.initial_lr,
+            max_steps=total_epochs - warmup_epochs,
+            last_epoch=-1  # Let PyTorch increment properly
+        )
 
-        # Combine schedulers
-        lr_scheduler = SequentialLR(optimizer,
-                                    schedulers=[warmup_scheduler, main_scheduler],
-                                    milestones=[warmup_epochs])
+        # Combine warmup + poly
+        lr_scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_epochs]
+        )
 
         return optimizer, lr_scheduler
-
 
     def on_train_epoch_start(self):
         self.network.train()

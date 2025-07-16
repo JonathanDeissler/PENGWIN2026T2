@@ -18,3 +18,16 @@ class PolyLRScheduler(_LRScheduler):
         new_lr = self.initial_lr * (1 - current_step / self.max_steps) ** self.exponent
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = new_lr
+
+
+class PytorchCompliantPolyLRScheduler(_LRScheduler):
+    def __init__(self, optimizer, initial_lr: float, max_steps: int, exponent: float = 0.9, last_epoch: int = -1):
+        self.initial_lr = initial_lr
+        self.max_steps = max_steps
+        self.exponent = exponent
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        step = min(self.last_epoch, self.max_steps)
+        factor = (1 - step / self.max_steps) ** self.exponent
+        return [self.initial_lr * factor for _ in self.optimizer.param_groups]
