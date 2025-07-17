@@ -1481,7 +1481,65 @@ class trialsTrainerClickGenOnlyTumorLRWarmup(trialsTrainerClickGenRemLastClass):
         warmup_epochs = 50
         total_epochs = self.num_epochs  # 1000
 
+        # After creating optimizer
+        for group in optimizer.param_groups:
+            group['initial_lr'] = self.initial_lr  # hard-code base
+
         # Warmup: linear from 1e-3 * initial_lr to initial_lr
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=1e-3,
+            end_factor=1.0,
+            total_iters=warmup_epochs
+        )
+
+        # Poly decay: from initial_lr → 0 across the remaining epochs
+        poly_scheduler = PytorchCompliantPolyLRScheduler(
+            optimizer,
+            initial_lr=self.initial_lr,
+            max_steps=total_epochs - warmup_epochs
+        )
+
+        # Chain them together
+        lr_scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, poly_scheduler],
+            milestones=[warmup_epochs]
+        )
+        return optimizer, lr_scheduler
+
+    def on_train_epoch_start(self):
+        self.network.train()
+        self.lr_scheduler.step()
+        self.print_to_log_file('')
+        self.print_to_log_file(f'Epoch {self.current_epoch}')
+        self.print_to_log_file(
+            f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
+        # lrs are the same for all workers so we don't need to gather them in case of DDP training
+        self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+
+class trialsTrainerClickGenOnlyTumorSlowWarmup(trialsTrainerClickGenRemLastClass):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.SGD(
+            self.network.parameters(),
+            lr=self.initial_lr,
+            weight_decay=self.weight_decay,
+            momentum=0.99,
+            nesterov=True
+        )
+
+        warmup_epochs = 50
+        total_epochs = self.num_epochs  # 1000
+
+        for group in optimizer.param_groups:
+            group['initial_lr'] = self.initial_lr  # hard-code base
+        # Warmup: linear from 1e-3 * initial_lr to initial_lr
+
+
         warmup_scheduler = LinearLR(
             optimizer,
             start_factor=1e-3,
