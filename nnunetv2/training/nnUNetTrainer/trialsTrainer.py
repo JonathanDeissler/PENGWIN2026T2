@@ -1470,14 +1470,18 @@ class trialsTrainerClickGenOnlyTumorLRWarmup(trialsTrainerClickGenRemLastClass):
         super().__init__(plans, configuration, fold, dataset_json, device)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.SGD(self.network.parameters(), self.initial_lr,
-                                    weight_decay=self.weight_decay,
-                                    momentum=0.99, nesterov=True)
+        optimizer = torch.optim.SGD(
+            self.network.parameters(),
+            lr=self.initial_lr,
+            weight_decay=self.weight_decay,
+            momentum=0.99,
+            nesterov=True
+        )
 
         warmup_epochs = 50
-        total_epochs = self.num_epochs
+        total_epochs = self.num_epochs  # 1000
 
-        # Warmup: linear LR from 1e-3 * lr → lr over warmup_epochs
+        # Warmup: linear from 1e-3 * initial_lr to initial_lr
         warmup_scheduler = LinearLR(
             optimizer,
             start_factor=1e-3,
@@ -1485,21 +1489,19 @@ class trialsTrainerClickGenOnlyTumorLRWarmup(trialsTrainerClickGenRemLastClass):
             total_iters=warmup_epochs
         )
 
-        # PolyLR: decay after warmup_epochs
-        main_scheduler = PytorchCompliantPolyLRScheduler(
+        # Poly decay: from initial_lr → 0 across the remaining epochs
+        poly_scheduler = PytorchCompliantPolyLRScheduler(
             optimizer,
             initial_lr=self.initial_lr,
-            max_steps=total_epochs - warmup_epochs,
-            last_epoch=-1  # Let PyTorch increment properly
+            max_steps=total_epochs - warmup_epochs
         )
 
-        # Combine warmup + poly
+        # Chain them together
         lr_scheduler = SequentialLR(
             optimizer,
-            schedulers=[warmup_scheduler, main_scheduler],
+            schedulers=[warmup_scheduler, poly_scheduler],
             milestones=[warmup_epochs]
         )
-
         return optimizer, lr_scheduler
 
     def on_train_epoch_start(self):

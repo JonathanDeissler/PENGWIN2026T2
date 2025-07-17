@@ -28,6 +28,6 @@ class PytorchCompliantPolyLRScheduler(_LRScheduler):
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
-        step = min(self.last_epoch, self.max_steps)
+        step = max(0, min(self.last_epoch, self.max_steps))
         factor = (1 - step / self.max_steps) ** self.exponent
         return [self.initial_lr * factor for _ in self.optimizer.param_groups]
