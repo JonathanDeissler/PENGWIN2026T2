@@ -1571,3 +1571,11 @@ class trialsTrainerClickGenOnlyTumorSlowWarmup(trialsTrainerClickGenRemLastClass
             f"Current learning rate: {np.round(self.optimizer.param_groups[0]['lr'], decimals=5)}")
         # lrs are the same for all workers so we don't need to gather them in case of DDP training
         self.logger.log('lrs', self.optimizer.param_groups[0]['lr'], self.current_epoch)
+
+
+class trialsTrainerClickGenOnlyTumorOversample05(trialsTrainerClickGenRemLastClass):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+        self.oversample_foreground_percent = 0.5
