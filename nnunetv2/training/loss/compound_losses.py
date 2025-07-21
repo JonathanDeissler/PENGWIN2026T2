@@ -1,3 +1,5 @@
+from xmlrpc.client import escape
+
 import torch
 from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLoss, FocalTversky_loss
 from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss
@@ -77,7 +79,15 @@ class FocalTversky_and_CE_loss(nn.Module):
 
         self.ce = RobustCrossEntropyLoss(**ce_kwargs)
         soft_dice_kwargs["apply_nonlin"] = softmax_helper_dim1
-        self.dc = FocalTversky_loss(soft_dice_kwargs)
+
+        # remove gamma from soft_dice_kwargs
+        if 'gamma' in soft_dice_kwargs:
+            gamma = soft_dice_kwargs['gamma']
+            del soft_dice_kwargs['gamma']
+
+            self.dc = FocalTversky_loss(soft_dice_kwargs, gamma=gamma)
+        else:
+            self.dc = FocalTversky_loss(soft_dice_kwargs)
 
     def forward(self, net_output: torch.Tensor, target: torch.Tensor):
         """
