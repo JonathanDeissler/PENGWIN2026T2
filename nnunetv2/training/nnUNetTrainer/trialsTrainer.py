@@ -1652,3 +1652,11 @@ class trialsTrainerClickGenOnlyTumorOversample05TverskyLoss(trialsTrainerClickGe
         super().__init__(plans, configuration, fold, dataset_json, device)
 
         self.oversample_foreground_percent = 0.5
+
+
+class trialsTrainerClickGenOnlyTumorOversample95(trialsTrainerClickGenRemLastClass):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+        self.oversample_foreground_percent = 0.95
