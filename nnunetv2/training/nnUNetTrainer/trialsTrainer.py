@@ -1645,3 +1645,10 @@ class trialsTrainerClickGenOnlyTumorFocalTverskyLossPaperBest(trialsTrainerClick
             # now wrap the loss
             loss = DeepSupervisionWrapper(loss, weights)
         return loss
+
+class trialsTrainerClickGenOnlyTumorOversample05TverskyLoss(trialsTrainerClickGenOnlyTumorFocalTverskyLossPaperBest):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+        self.oversample_foreground_percent = 0.5
