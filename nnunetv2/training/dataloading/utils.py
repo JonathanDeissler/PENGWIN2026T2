@@ -348,9 +348,10 @@ def generated_sparse_to_dense_point_gauss(clicks: dict, shape: tuple[int, ...], 
 def generated_sparse_to_dense_point_nnInteractive(clicks: dict, shape: tuple[int, ...], sigma: float = 1.0) -> np.ndarray:
     pos_clicks, neg_clicks = torch.zeros(shape, dtype=torch.float32), torch.zeros(shape, dtype=torch.float32)
     point_interaction = PointInteraction_stub(point_radius=sigma, use_distance_transform=True)
-    if len(clicks["background"]) > 0:
+    if len(clicks["lesion"]) > 0:
         for clck in clicks["lesion"]:
             pos_clicks = point_interaction.place_point(clck, pos_clicks, binarize=False)
+    if len(clicks["background"]) > 0:
         for clck in clicks["background"]:
             neg_clicks = point_interaction.place_point(clck, neg_clicks, binarize=False)
     return pos_clicks, neg_clicks
