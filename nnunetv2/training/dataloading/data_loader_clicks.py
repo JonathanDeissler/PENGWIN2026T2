@@ -693,13 +693,13 @@ class nnUNetDataLoaderClicksGeneratedDebug(nnUNetDataLoader):
 
 
                         #select click amount
-                        num_pos_clicks, num_neg_clicks = select_num_points_exp()
-                        # num_neg_clicks = 0
-                        # num_pos_clicks = 0
-                        if clicks["lesion"] != []:
-                            clicks["lesion"] = clicks["lesion"][:num_pos_clicks]
-                        if clicks["background"]  != []:
-                            clicks["background"] = clicks["background"][:num_neg_clicks]
+                        # num_pos_clicks, num_neg_clicks = select_num_points_exp()
+                        # # num_neg_clicks = 0
+                        # # num_pos_clicks = 0
+                        # if clicks["lesion"] != []:
+                        #     clicks["lesion"] = clicks["lesion"][:num_pos_clicks]
+                        # if clicks["background"]  != []:
+                        #     clicks["background"] = clicks["background"][:num_neg_clicks]
 
                         pos_clicks, neg_clicks = generated_sparse_to_dense_point_nnInteractive(clicks, helper_seg.shape,
                                                                                        sigma=self.point_width)
