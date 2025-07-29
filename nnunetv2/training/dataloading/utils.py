@@ -165,7 +165,7 @@ def restructure_clicks(click_json):
     return clicks
 
 
-def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_offset: int = None, use_gpu: bool = False) -> dict[str, List[List[int]]]:
+def simulate_clicks(input_label, input_liver, pos_click_budget=10, neg_click_budget=10, center_offset: int = None, edge_offset: int = None, use_gpu: bool = False) -> dict[str, List[List[int]]]:
 
 
     SEED = 42
@@ -184,7 +184,7 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
         ##### Tumor Clicks #####
         connected_components = cc3d.connected_components(label_im, connectivity=26)
         unique_labels = np.unique(connected_components)[1:] # Skip background label 0
-        size = min(10, len(unique_labels))
+        size = min(pos_click_budget, len(unique_labels))
         sampled_labels = np.random.choice(unique_labels, size=size, replace=False)
 
         # Sample center clicks for 10 random components
@@ -208,7 +208,7 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
         n_clicks = len(clicks['lesion'])
 
         # Sample boundary clicks if center clicks were not enough to fill the click budget (n=10)
-        while n_clicks < 10:
+        while n_clicks < pos_click_budget:
             for label in sampled_labels:
                 labeled_mask = connected_components == label
                 labeled_mask = np.array(labeled_mask)
@@ -218,7 +218,6 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
                     # edt = morphology.distance_transform_edt(labeled_mask)
                 else:
                     edt = fastedt.edt(labeled_mask)
-                    edt_inverted = (np.max(edt) - edt) * (edt > 0)
                     # boundary_elements = (edt_inverted == np.max(edt_inverted)) * (labeled_mask > 0)
                     # indices = np.array(np.nonzero(boundary_elements)).T  # Shape: (num_true, ndim)
                     #
@@ -238,7 +237,7 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
                 clicks['lesion'].append([int(boundary_click[0]), int(boundary_click[1]), int(boundary_click[2])])
                 assert label_im[int(boundary_click[0]), int(boundary_click[1]), int(boundary_click[2])]
                 n_clicks += 1
-                if n_clicks == 10:
+                if n_clicks == pos_click_budget:
                     break
 
     ##### Background Clicks #####
@@ -247,31 +246,31 @@ def simulate_clicks(input_label, input_liver, center_offset: int = None, edge_of
         # print("[WARNING] Liver mask is empty no bg clicks")
         clicks['background'] = []
     else:
-        bg_clicks = uniform_sample_coordinates(in_liver, label_im) # sample non-tumor clicks in the liver
+        bg_clicks = uniform_sample_coordinates(in_liver, label_im,neg_click_budget) # sample non-tumor clicks in the liver
         clicks['background'] = bg_clicks
 
     return clicks
 
-def perturb_click(offset, click, label_im):
-    import random
-    random_offset = [random.randint(0, int(offset)) for _ in range(3)]
-    try:
-        if label_im[
-            int(click[0] + random_offset[0]),
-            int(click[1] + random_offset[1]),
-            int(click[2] + random_offset[2])
-        ]:
-            return [
-                int(click[0] + random_offset[0]),
-                int(click[1] + random_offset[1]),
-                int(click[2] + random_offset[2])
-            ]
-        else:
-            # Fallback to original click if perturbed click is invalid
-            return [int(click[0]), int(click[1]), int(click[2])]
-    except IndexError:
-        # If the perturbed click is out of bounds, return the original click
-        return [int(click[0]), int(click[1]), int(click[2])]
+# def perturb_click(offset, click, label_im):
+#     import random
+#     random_offset = [random.randint(0, int(offset)) for _ in range(3)]
+#     try:
+#         if label_im[
+#             int(click[0] + random_offset[0]),
+#             int(click[1] + random_offset[1]),
+#             int(click[2] + random_offset[2])
+#         ]:
+#             return [
+#                 int(click[0] + random_offset[0]),
+#                 int(click[1] + random_offset[1]),
+#                 int(click[2] + random_offset[2])
+#             ]
+#         else:
+#             # Fallback to original click if perturbed click is invalid
+#             return [int(click[0]), int(click[1]), int(click[2])]
+#     except IndexError:
+#         # If the perturbed click is out of bounds, return the original click
+#         return [int(click[0]), int(click[1]), int(click[2])]
 
 def uniform_sample_coordinates(in_liver, label_im, num_samples=10):
     """
@@ -372,6 +371,115 @@ def sparse_to_dense_point_nnInteractive(points: dict[str, np.ndarray], shape: tu
                 raise ValueError(f"Unknown label {label} in click json")
     return pos_clicks, neg_clicks
 
+
+####### Simulate clicks advanced ########
+
+
+
+def random_point_within_mask(mask):
+    coords = np.argwhere(mask)
+    if coords.shape[0] == 0:
+        return None
+    idx = np.random.choice(coords.shape[0])
+    return tuple(coords[idx])
+
+
+def perturb_click(offset, center, mask):
+    max_attempts = 10
+
+    for _ in range(max_attempts):
+        perturbed = np.array(center) + np.random.randint(-offset, offset + 1, size=3)
+        perturbed = np.clip(perturbed, 0, np.array(mask.shape) - 1)
+        if mask[tuple(perturbed)]:
+            return tuple(perturbed)
+    return center
+
+
+def sample_point_within_region(mask, edt_weight=0.7):
+    # Mix of center and random sampling
+    edt = fastedt.edt(mask.astype(np.uint8))
+    edt = edt / (np.max(edt) + 1e-5)
+    noise = np.random.rand(*mask.shape)
+    score = edt_weight * edt + (1 - edt_weight) * noise
+    score *= mask
+    idx = np.unravel_index(np.argmax(score), score.shape)
+    return idx
+
+
+def simulate_clicks_advanced(input_label, input_liver, fg=True, bg=True, center_offset=None, edge_offset=None,
+                             pos_click_budget=10, neg_click_budget=10, use_gpu=True):
+    if isinstance(input_label, np.ndarray):
+        label_im = input_label.copy()
+        label_im[label_im < 0] = 0
+    else:
+        raise ValueError("input_label must be numpy array")
+
+    clicks = {'lesion': [], 'background': []}
+
+    if fg and np.sum(label_im) > 0:
+        connected_components = cc3d.connected_components(label_im, connectivity=26)
+        unique_labels = np.unique(connected_components)[1:]
+        size = min(pos_click_budget, len(unique_labels))
+        sampled_labels = np.random.choice(unique_labels, size=size, replace=False)
+
+        n_clicks = 0
+        for label in sampled_labels:
+            mask = connected_components == label
+            point = sample_point_within_region(mask, edt_weight=np.random.uniform(0.4, 0.9))
+            if center_offset is not None:
+                point = perturb_click(center_offset, point, mask)
+            clicks['lesion'].append(list(map(int, point)))
+            n_clicks += 1
+
+        # Fill remaining clicks with near-boundary points inside the object
+        counter = 0
+        while n_clicks < pos_click_budget:
+            for label in sampled_labels:
+                mask = connected_components == label
+                edt = fastedt.edt(mask.astype(np.uint8))
+                # get boundary by thresholding the EDT at a small value (low percentile)
+                soft_boundary_mask = mask & (edt < 3)
+                point = sample_point_within_region(soft_boundary_mask, edt_weight=np.random.uniform(0.2, 0.6))
+                if edge_offset is not None:
+                    point = perturb_click(edge_offset, point, mask)
+                clicks['lesion'].append(list(map(int, point)))
+                n_clicks += 1
+                if n_clicks == pos_click_budget:
+                    break
+            counter += 1
+            if counter > 10:
+                print("Warning: Unable to sample enough background clicks. Please check your label image.")
+                break
+
+    if bg:
+        assert isinstance(input_liver, np.ndarray), "input_pet must be numpy array"
+        n_clicks = 0
+        point = sample_point_within_region(input_liver, edt_weight=np.random.uniform(0.4, 0.9))
+        if center_offset is not None:
+            point = perturb_click(center_offset, point, input_liver)
+        clicks['background'].append(list(map(int, point)))
+        n_clicks += 1
+
+        # Fill remaining clicks with near-boundary points inside the object
+        counter = 0
+        while n_clicks < neg_click_budget:
+
+            edt = fastedt.edt(input_liver.astype(np.uint8))
+            # get boundary by thresholding the EDT at a small value (low percentile)
+            soft_boundary_mask = input_liver & (edt < 3)
+            point = sample_point_within_region(soft_boundary_mask, edt_weight=np.random.uniform(0.2, 0.6))
+            if edge_offset is not None:
+                point = perturb_click(edge_offset, point, input_liver)
+            clicks['background'].append(list(map(int, point)))
+            n_clicks += 1
+            if n_clicks == neg_click_budget:
+                break
+            counter += 1
+            if counter > 10:
+                print("Warning: Unable to sample enough background clicks. Please check your label image.")
+                break
+
+    return clicks
 
 
 if __name__ == '__main__':
