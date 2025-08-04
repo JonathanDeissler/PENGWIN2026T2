@@ -372,6 +372,85 @@ def sparse_to_dense_point_nnInteractive(points: dict[str, np.ndarray], shape: tu
     return pos_clicks, neg_clicks
 
 
+###### place precomputed click representations in the click maps #######
+
+def place_precomputed_clicks(clicks: dict[str, np.ndarray],precomputed_point_reprentation, map_shape, device):
+
+    """
+    Place precomputed click representations in the click maps.
+    Args:
+        clicks (dict): Dictionary containing 'lesion' and 'background' keys with lists of click coordinates.
+        precomputed_point_reprentation (torch.Tensor): Precomputed point representation for clicks.
+        map_shape (tuple): Shape of the output click maps.
+    Returns:
+        pos_clicks (torch.Tensor): Click map for positive clicks.
+        neg_clicks (torch.Tensor): Click map for negative clicks.
+    """
+    pos_clicks = torch.zeros(map_shape, dtype=torch.float32, device=device)
+    neg_clicks = torch.zeros(map_shape, dtype=torch.float32, device=device)
+
+    for clck in clicks['lesion']:
+        pos_clicks = do_place_at_location(clck, precomputed_point_reprentation, pos_clicks)
+    for clck in clicks['background']:
+        neg_clicks = do_place_at_location(clck, precomputed_point_reprentation, neg_clicks)
+
+    return pos_clicks.unsqueeze(0), neg_clicks.unsqueeze(0)
+
+
+def select_interactions_based_on_epochs(interactions , current_epoch, num_epochs, max_interactions=10):
+    """
+    Select interactions based on the current epoch and total number of epochs.
+    Args:
+        interactions (list): List of interactions to select from.
+        current_epoch (int): Current epoch number.
+        num_epochs (int): Total number of epochs.
+    Returns:
+        selected_interactions (list): Interactions selected for the current epoch.
+    """
+    if not isinstance(interactions, list):
+        raise ValueError("interactions must be a list")
+
+    if current_epoch < 0 or current_epoch >= num_epochs:
+        raise ValueError("current_epoch must be between 0 and num_epochs - 1")
+
+    increse_every = num_epochs // max_interactions
+
+    if increse_every == 0:
+        current_ammount = 0
+    else:
+        current_ammount = current_epoch // increse_every
+
+    for b in range(len(interactions)):
+        if interactions[b]['lesion'] != []:
+            interactions[b]['lesion'] = interactions[b]['lesion'][:np.min((current_ammount -1,len(interactions[b]['lesion'])-1))]
+        if interactions[b]['background'] != []:
+            interactions[b]['background'] = interactions[b]['background'][:np.min((current_ammount -1,len(interactions[b]['background'])-1))]
+
+    return interactions
+
+def do_place_at_location(click, precomputed_point_reprentation, interaction_map):
+
+
+    big_shape = interaction_map.shape
+    small_shape = precomputed_point_reprentation.shape
+    offset = [s // 2 for s in small_shape]
+
+    # Compute start and end indices for big
+    start_big = [max(0, l - o) for l, o in zip(click, offset)]
+    end_big = [min(dim, l - o + s) for l, o, s, dim in zip(click, offset, small_shape, big_shape)]
+
+    # Corresponding start/end for small
+    start_small = [max(0, o - l) if l - o < 0 else 0 for l, o in zip(click, offset)]
+    end_small = [start + (end - st) for start, end, st in zip(start_small, end_big, start_big)]
+
+    # Now, slice
+    region_big = interaction_map[start_big[0]:end_big[0], start_big[1]:end_big[1], start_big[2]:end_big[2]]
+    region_small = precomputed_point_reprentation[start_small[0]:end_small[0], start_small[1]:end_small[1], start_small[2]:end_small[2]]
+
+    # In-place max
+    region_big.copy_(torch.maximum(region_big, region_small))
+
+    return interaction_map
 ####### Simulate clicks advanced ########
 
 

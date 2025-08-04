@@ -752,6 +752,125 @@ class nnUNetDataLoaderClicksGeneratedAdvancedGeneration(nnUNetDataLoader):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
 
+
+class nnUNetDataLoaderClicksGeneratedNoPlace(nnUNetDataLoader):
+    def __init__(self,
+                 data: nnUNetBaseDataset,
+                 batch_size: int,
+                 patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
+                 final_patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
+                 label_manager: LabelManager,
+                 oversample_foreground_percent: float = 0.0,
+                 sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
+                 pad_sides: Union[List[int], Tuple[int, ...]] = None,
+                 probabilistic_oversampling: bool = False,
+                 transforms=None,
+                 point_width: float = 1.5):
+        super().__init__(data, batch_size, patch_size, final_patch_size, label_manager,
+                         oversample_foreground_percent, sampling_probabilities, pad_sides,
+                         probabilistic_oversampling, transforms)
+        self.point_width = point_width
+
+
+    def generate_train_batch(self):
+        selected_keys = self.get_indices()
+        # preallocate memory for data and seg
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+        helper_all = np.zeros(self.seg_shape, dtype=np.int16)
+        clicks_all = []
+
+        for j, i in enumerate(selected_keys):
+            # oversampling foreground will improve stability of model training, especially if many patches are empty
+            # (Lung for example)
+            force_fg = self.get_do_oversample(j)
+
+            data, seg, seg_prev, hepler_seg, properties = self._data.load_case_helper(i)
+            shape = data.shape[1:]
+
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            bbox = [[i, j] for i, j in zip(bbox_lbs, bbox_ubs)]
+
+            # use ACVL utils for that. Cleaner.
+            data_all[j] = crop_and_pad_nd(data, bbox, 0)
+
+            seg_cropped = crop_and_pad_nd(seg, bbox, -1)
+            helper_seg_cropped = crop_and_pad_nd(hepler_seg, bbox, -1)
+            if seg_prev is not None:
+                seg_cropped = np.vstack((seg_cropped, crop_and_pad_nd(seg_prev, bbox, -1)))
+            seg_all[j] = seg_cropped
+            helper_all[j] = helper_seg_cropped
+
+
+
+        if self.patch_size_was_2d:
+            data_all = data_all[:, :, 0]
+            seg_all = seg_all[:, :, 0]
+
+        if self.transforms is not None:
+            with torch.no_grad():
+                with threadpool_limits(limits=1, user_api=None):
+                    data_all = torch.from_numpy(data_all).float()
+
+                    seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                    helper_all = torch.from_numpy(helper_all).to(torch.int16)
+                    images = []
+                    segs = []
+                    for b in range(self.batch_size):
+                        #split off liver to second channel (label -1)
+                        # liver = np.zeros_like(seg_all[b], dtype=np.int16)
+                        # liver[seg_all[b] == highest_class_index] = 1  # make sure we only have one class
+                        # # append to segall
+                        #
+                        # import napari
+                        # viewer = napari.Viewer()
+                        # viewer.add_image(data_all[b][0].numpy(), name='CT')
+                        # viewer.add_labels(seg_all[b][0].numpy(), name='segmentation')
+                        # viewer.add_labels(liver, name='liver')
+                        # napari.run()
+                        seg_stacked = torch.from_numpy(np.vstack((seg_all[b], helper_all[b])))
+
+                        tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_stacked})
+
+
+
+                        seg = tmp['segmentation'][0].numpy()
+                        helper_seg = tmp['segmentation'][1].numpy()
+
+                        if np.sum(seg) != 0 and np.sum(helper_seg) == 0:
+                            print("lol wat happend here ?")
+
+                        num_pos_clicks, num_neg_clicks = select_num_points_exp()
+
+                        if np.random.rand() < 0.8:  # 80% chance to use the normal click simulation
+                            clicks = simulate_clicks(seg, helper_seg,pos_click_budget=num_pos_clicks,
+                                                              neg_click_budget=num_neg_clicks, center_offset=3, edge_offset=3, use_gpu=False)
+                        else:  # 20% chance to use the advanced click simulation
+                            clicks = simulate_clicks_advanced(seg, helper_seg, fg=True, bg=True,
+                                                              center_offset=3, edge_offset=3,
+                                                              pos_click_budget=num_pos_clicks,
+                                                              neg_click_budget=num_neg_clicks, use_gpu=False)
+
+                        clicks_all.append(clicks)
+
+
+                        images.append(tmp['image'])
+                        if len (seg.shape) == 3:
+                            segs.append(torch.from_numpy(seg).unsqueeze(0))
+                        else:
+                            segs.append(torch.from_numpy(seg))
+                        pass
+                    data_all = torch.stack(images)
+                    if isinstance(segs[0], list):
+                        seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+                    else:
+                        seg_all = torch.stack(segs)
+                    del segs, images  # , clicks, clicks_all, pos_clicks, neg_clicks, tmp
+
+        # check if more then 1 nonzero value is in the segs if so remove it
+
+        return {'data': data_all, 'target': seg_all, 'keys': selected_keys, 'interactions': clicks_all}
+
 class nnUNetDataLoaderClicksGeneratedDebug(nnUNetDataLoader):
     def __init__(self,
                  data: nnUNetBaseDataset,

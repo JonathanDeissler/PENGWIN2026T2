@@ -49,8 +49,10 @@ from tqdm import tqdm
 import json
 import csv
 from nnunetv2.evaluation.challenge_eval_util import process_case, group_jsons_by_prefix, aggregate_group_metrics
+from nnunetv2.training.dataloading.nnInteractive_clicks import build_point
 from nnunetv2.training.dataloading.utils import restructure_clicks, sparse_to_dense_point_gauss, \
-    generated_sparse_to_dense_point_nnInteractive, sparse_to_dense_point_nnInteractive
+    generated_sparse_to_dense_point_nnInteractive, sparse_to_dense_point_nnInteractive, place_precomputed_clicks, \
+    select_interactions_based_on_epochs
 from nnunetv2.configuration import ANISO_THRESHOLD, default_num_processes
 from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder, evaluate_simple_entry_point
 from nnunetv2.inference.export_prediction import export_prediction_from_logits, resample_and_save
@@ -62,7 +64,7 @@ from nnunetv2.training.data_augmentation.custom_transforms.misalign import Misal
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.training.dataloading.data_loader_clicks import nnUNetDataLoaderClicks, nnUNetDataLoaderClicksGenerated, \
     nnUNetDataLoaderClicksGeneratedHelper, nnUNetDataLoaderClicksGeneratedDebug, \
-    nnUNetDataLoaderClicksGeneratedAdvancedGeneration
+    nnUNetDataLoaderClicksGeneratedAdvancedGeneration, nnUNetDataLoaderClicksGeneratedNoPlace
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2, nnUNetDatasetHelperSeg
 from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss, FocalTversky_and_CE_loss
@@ -437,6 +439,11 @@ class trialsTrainer(nnUNetTrainer):
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data, )
             # del data
+            #
+            # import IPython;IPython.embed()
+            # from BatchViewer import view_batch
+            # view_batch(data[1], target[0][1], output[0][1])
+
             l = self.loss(output, target)
 
         if self.grad_scaler is not None:
@@ -673,6 +680,8 @@ class trialsTrainerClickGen(nnUNetTrainer):
         self.initial_lr = 1e-3
         self.enable_deep_supervision = False
         self.point_width =1.5
+        # self.num_iterations_per_epoch = 5
+        # self.num_val_iterations_per_epoch = 5
 
     def _build_loss(self):
         # set smooth to 0
@@ -844,8 +853,16 @@ class trialsTrainerClickGen(nnUNetTrainer):
         # So autocast will only be active if we have a cuda device.
         with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
             output = self.network(data, )
+
             # del data
             l = self.loss(output, target)
+            # print('train for key', batch['keys'],l.item())
+            #
+            # # import IPython;IPython.embed()
+            #
+            # from batchviewer import view_batch
+            # view_batch(data[1], target[1], torch.softmax(output[1], dim = 0))
+
             # import napari
             # viewer = napari.Viewer()
             #
@@ -893,6 +910,13 @@ class trialsTrainerClickGen(nnUNetTrainer):
             output = self.network(data, )
             del data
             l = self.loss(output, target)
+            # print('val for key', batch['keys'],l.item())
+            # if "venous_221" in batch['keys']:
+            #     from batchviewer import view_batch
+            #     view_batch(data[1], target[1], torch.softmax(output[1], dim=0))
+            # # import IPython;IPython.embed()
+            # from batchviewer import view_batch
+            # view_batch(data[1], target[1], torch.softmax(output[1], dim=0))
 
         # we only need the output with the highest output resolution (if DS enabled)
         if self.enable_deep_supervision:
@@ -1464,6 +1488,8 @@ class trialsTrainerClickGenRemLastClass(trialsTrainerClickGen):
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
 
+    # def train_step(self, batch: dict) -> dict:
+
 class trialsTrainerClickGenAdvanced(trialsTrainerClickGen):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
@@ -1554,6 +1580,233 @@ class trialsTrainerClickGenAdvanced(trialsTrainerClickGen):
         _ = next(mt_gen_train)
         _ = next(mt_gen_val)
         return mt_gen_train, mt_gen_val
+
+
+class trialsTrainerClickGenPointScheduling(trialsTrainerClickGenAdvanced):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.point_width = 2
+        self.dataset_class = nnUNetDatasetHelperSeg
+        self.precomputed_point =  build_point(tuple((self.point_width,self.point_width,self.point_width)), use_distance_transform=True, binarize=False).to(self.device)
+
+    def get_dataloaders(self):
+
+        # we use the patch size to determine whether we need 2D or 3D dataloaders. We also use it to determine whether
+        # we need to use dummy 2D augmentation (in case of 3D training) and what our initial patch size should be
+        patch_size = self.configuration_manager.patch_size
+
+        # needed for deep supervision: how much do we need to downscale the segmentation targets for the different
+        # outputs?
+        deep_supervision_scales = self._get_deep_supervision_scales()
+
+        (
+            rotation_for_DA,
+            do_dummy_2d_data_aug,
+            initial_patch_size,
+            mirror_axes,
+        ) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+
+        # training pipeline
+        tr_transforms = self.get_training_transforms(
+            patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes, do_dummy_2d_data_aug,
+            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+            is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
+            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+            ignore_label=self.label_manager.ignore_label)
+
+        # validation pipeline
+        val_transforms = self.get_validation_transforms(deep_supervision_scales,
+                                                        is_cascaded=self.is_cascaded,
+                                                        foreground_labels=self.label_manager.foreground_labels,
+                                                        regions=self.label_manager.foreground_regions if
+                                                        self.label_manager.has_regions else None,
+                                                        ignore_label=self.label_manager.ignore_label)
+
+        # tr_transforms = self.get_training_transforms(
+        #     patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes, do_dummy_2d_data_aug,
+        #     use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+        #     is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
+        #     regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+        #     ignore_label=self.label_manager.ignore_label)
+        #
+        # # validation pipeline
+        # val_transforms = self.get_validation_transforms(deep_supervision_scales,
+        #                                                 is_cascaded=self.is_cascaded,
+        #                                                 foreground_labels=self.label_manager.foreground_labels,
+        #                                                 regions=self.label_manager.foreground_regions if
+        #                                                 self.label_manager.has_regions else None,
+        #                                                 ignore_label=self.label_manager.ignore_label)
+
+        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
+
+        dl_tr = nnUNetDataLoaderClicksGeneratedNoPlace(dataset_tr, self.batch_size,
+                                       initial_patch_size,
+                                       self.configuration_manager.patch_size,
+                                       self.label_manager,
+                                       oversample_foreground_percent=self.oversample_foreground_percent,
+                                       sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
+                                       probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width)
+        dl_val = nnUNetDataLoaderClicksGeneratedNoPlace(dataset_val, self.batch_size,
+                                        self.configuration_manager.patch_size,
+                                        self.configuration_manager.patch_size,
+                                        self.label_manager,
+                                        oversample_foreground_percent=self.oversample_foreground_percent,
+                                        sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
+                                        probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width)
+
+        allowed_num_processes = get_allowed_n_proc_DA()
+        if allowed_num_processes == 0:
+            mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
+            mt_gen_val = SingleThreadedAugmenter(dl_val, None)
+        else:
+            mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=dl_tr, transform=None,
+                                                        num_processes=allowed_num_processes,
+                                                        num_cached=min(max(6, allowed_num_processes // 2),10), seeds=None,
+                                                        pin_memory=self.device.type == 'cuda', wait_time=0.002)
+            mt_gen_val = NonDetMultiThreadedAugmenter(data_loader=dl_val,
+                                                      transform=None, num_processes=max(1, allowed_num_processes // 2),
+                                                      num_cached=max(3, allowed_num_processes // 4), seeds=None,
+                                                      pin_memory=self.device.type == 'cuda',
+                                                      wait_time=0.002)
+        # # let's get this party started
+        _ = next(mt_gen_train)
+        _ = next(mt_gen_val)
+        return mt_gen_train, mt_gen_val
+
+
+    def validation_step(self, batch: dict) -> dict:
+        data = batch['data']
+        target = batch['target']
+        interactions = batch['interactions']
+
+        data = data.to(self.device, non_blocking=True)
+        all_data = []
+        for b in range(len(data)):
+            pos_clicks, neg_clicks = place_precomputed_clicks(interactions[b], self.precomputed_point, data.shape[2:],
+                                                              self.device)
+            all_data.append(torch.cat((data[b], pos_clicks, neg_clicks), dim=0))
+
+        data = torch.stack(all_data, dim=0)
+        if isinstance(target, list):
+            target = [(i[:, :1].to(self.device, non_blocking=True), i[:, 1:].to(self.device, non_blocking=True)) for i
+                      in target]
+            target, target_organs = zip(*target)
+        else:
+            target = target.to(self.device, non_blocking=True)
+
+        # Autocast can be annoying
+        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            output = self.network(data, )
+            del data
+            l = self.loss(output, target)
+            # print('val for key', batch['keys'],l.item())
+            # if "venous_221" in batch['keys']:
+            #     from batchviewer import view_batch
+            #     view_batch(data[1], target[1], torch.softmax(output[1], dim=0))
+            # # import IPython;IPython.embed()
+            # from batchviewer import view_batch
+            # view_batch(data[1], target[1], torch.softmax(output[1], dim=0))
+
+        # we only need the output with the highest output resolution (if DS enabled)
+        if self.enable_deep_supervision:
+            output = output[0]
+            target = target[0]
+
+        # the following is needed for online evaluation. Fake dice (green line)
+        axes = [0] + list(range(2, output.ndim))
+
+        if self.label_manager.has_regions:
+            predicted_segmentation_onehot = (torch.sigmoid(output) > 0.5).long()
+        else:
+            # no need for softmax
+            output_seg = output.argmax(1)[:, None]
+            predicted_segmentation_onehot = torch.zeros(output.shape, device=output.device, dtype=torch.float32)
+            predicted_segmentation_onehot.scatter_(1, output_seg, 1)
+            del output_seg
+
+        if self.label_manager.has_ignore_label:
+            if not self.label_manager.has_regions:
+                mask = (target != self.label_manager.ignore_label).float()
+                # CAREFUL that you don't rely on target after this line!
+                target[target == self.label_manager.ignore_label] = 0
+            else:
+                if target.dtype == torch.bool:
+                    mask = ~target[:, -1:]
+                else:
+                    mask = 1 - target[:, -1:]
+                # CAREFUL that you don't rely on target after this line!
+                target = target[:, :-1]
+        else:
+            mask = None
+
+        tp, fp, fn, _ = get_tp_fp_fn_tn(predicted_segmentation_onehot, target, axes=axes, mask=mask)
+
+        tp_hard = tp.detach().cpu().numpy()
+        fp_hard = fp.detach().cpu().numpy()
+        fn_hard = fn.detach().cpu().numpy()
+        if not self.label_manager.has_regions:
+            # if we train with regions all segmentation heads predict some kind of foreground. In conventional
+            # (softmax training) there needs tobe one output for the background. We are not interested in the
+            # background Dice
+            # [1:] in order to remove background
+            tp_hard = tp_hard[1:]
+            fp_hard = fp_hard[1:]
+            fn_hard = fn_hard[1:]
+
+        return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
+    def train_step(self, batch: dict) -> dict:
+        data = batch['data']
+        target = batch['target']
+        interactions = batch['interactions']
+        interactions = select_interactions_based_on_epochs(interactions, self.current_epoch, self.num_epochs)
+
+        data = data.to(self.device, non_blocking=True)
+        all_data = []
+        for b in range(len(data)):
+
+            pos_clicks , neg_clicks = place_precomputed_clicks(interactions[b], self.precomputed_point, data.shape[2:], self.device)
+            all_data.append(torch.cat((data[b], pos_clicks, neg_clicks), dim=0))
+
+        data = torch.stack(all_data, dim=0)
+
+        if isinstance(target, list):
+            target = [(i[:, :1].to(self.device, non_blocking=True), i[:, 1:].to(self.device, non_blocking=True)) for i
+                      in target]
+            target, target_organs = zip(*target)
+
+        else:
+            # raise NotImplementedError()
+            target = target.to(self.device, non_blocking=True)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        # Autocast can be annoying
+        # If the device_type is 'cpu' then it's slow as heck and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            output = self.network(data, )
+
+            del data
+            l = self.loss(output, target)
+
+
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(l).backward()
+            self.grad_scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
+        return {'loss': l.detach().cpu().numpy()}
+
+
 
 class trialsTrainerDebug(trialsTrainerClickGenRemLastClass):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
