@@ -397,7 +397,7 @@ def place_precomputed_clicks(clicks: dict[str, np.ndarray],precomputed_point_rep
     return pos_clicks.unsqueeze(0), neg_clicks.unsqueeze(0)
 
 
-def select_interactions_based_on_epochs(interactions , current_epoch, num_epochs, max_interactions=10):
+def select_interactions_based_on_epochs(interactions , current_epoch, num_epochs, max_interactions=10, increase_every=None ):
     """
     Select interactions based on the current epoch and total number of epochs.
     Args:
@@ -413,12 +413,13 @@ def select_interactions_based_on_epochs(interactions , current_epoch, num_epochs
     if current_epoch < 0 or current_epoch >= num_epochs:
         raise ValueError("current_epoch must be between 0 and num_epochs - 1")
 
-    increse_every = num_epochs // max_interactions
+    if increase_every is None:
+        increase_every = num_epochs // max_interactions
 
-    if increse_every == 0:
+    if increase_every == 0:
         current_ammount = 0
     else:
-        current_ammount = current_epoch // increse_every
+        current_ammount = np.min((current_epoch // increase_every, max_interactions))
 
     for b in range(len(interactions)):
         if interactions[b]['lesion'] != []:

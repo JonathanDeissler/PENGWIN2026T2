@@ -765,11 +765,13 @@ class nnUNetDataLoaderClicksGeneratedNoPlace(nnUNetDataLoader):
                  pad_sides: Union[List[int], Tuple[int, ...]] = None,
                  probabilistic_oversampling: bool = False,
                  transforms=None,
-                 point_width: float = 1.5):
+                 point_width: float = 1.5,
+                 standard_click_simulation_probability: float = 0.8):
         super().__init__(data, batch_size, patch_size, final_patch_size, label_manager,
                          oversample_foreground_percent, sampling_probabilities, pad_sides,
                          probabilistic_oversampling, transforms)
         self.point_width = point_width
+        self.standard_click_simulation_probability = standard_click_simulation_probability
 
 
     def generate_train_batch(self):
@@ -842,7 +844,7 @@ class nnUNetDataLoaderClicksGeneratedNoPlace(nnUNetDataLoader):
 
                         num_pos_clicks, num_neg_clicks = select_num_points_exp()
 
-                        if np.random.rand() < 0.8:  # 80% chance to use the normal click simulation
+                        if np.random.rand() < self.standard_click_simulation_probability:  # 80% chance to use the normal click simulation
                             clicks = simulate_clicks(seg, helper_seg,pos_click_budget=num_pos_clicks,
                                                               neg_click_budget=num_neg_clicks, center_offset=3, edge_offset=3, use_gpu=False)
                         else:  # 20% chance to use the advanced click simulation
