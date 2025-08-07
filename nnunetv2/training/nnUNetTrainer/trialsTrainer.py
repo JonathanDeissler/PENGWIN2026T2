@@ -1765,7 +1765,7 @@ class trialsTrainerClickGenPointScheduling(trialsTrainerClickGenAdvanced):
         data = batch['data']
         target = batch['target']
         interactions = batch['interactions']
-        interactions = select_interactions_based_on_epochs(interactions, self.current_epoch, self.num_epochs, self.increase_every)
+        interactions = select_interactions_based_on_epochs(interactions=interactions, current_epoch=self.current_epoch,num_epochs=self.num_epochs, increase_every=self.increase_every)
 
         data = data.to(self.device, non_blocking=True)
         all_data = []
