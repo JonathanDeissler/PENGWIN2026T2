@@ -1591,6 +1591,7 @@ class trialsTrainerClickGenPointScheduling(trialsTrainerClickGenAdvanced):
         self.standard_click_simulation_probability = 0.8
         self.increase_every = None
         self.precomputed_point =  build_point(tuple((self.point_width,self.point_width,self.point_width)), use_distance_transform=True, binarize=False).to(self.device)
+        self.sampling_alpha = 0.2
         # self.num_iterations_per_epoch = 2
         # self.num_val_iterations_per_epoch = 2
 
@@ -1650,14 +1651,14 @@ class trialsTrainerClickGenPointScheduling(trialsTrainerClickGenAdvanced):
                                        self.label_manager,
                                        oversample_foreground_percent=self.oversample_foreground_percent,
                                        sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
-                                       probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width, standard_click_simulation_probability=self.standard_click_simulation_probability)
+                                       probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width, standard_click_simulation_probability=self.standard_click_simulation_probability, sampling_alpha=self.sampling_alpha)
         dl_val = nnUNetDataLoaderClicksGeneratedNoPlace(dataset_val, self.batch_size,
                                         self.configuration_manager.patch_size,
                                         self.configuration_manager.patch_size,
                                         self.label_manager,
                                         oversample_foreground_percent=self.oversample_foreground_percent,
                                         sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
-                                        probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width, standard_click_simulation_probability=self.standard_click_simulation_probability)
+                                        probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width, standard_click_simulation_probability=self.standard_click_simulation_probability, sampling_alpha=self.sampling_alpha)
 
         allowed_num_processes = get_allowed_n_proc_DA()
         if allowed_num_processes == 0:
@@ -1854,6 +1855,17 @@ class trialsTrainerClickGenPointSchedulingIncreseEvery50(trialsTrainerClickGenPo
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.increase_every = 50  # increase every 50 epochs
 
+class trialsTrainerClickGenPointSchedulingSampling01(trialsTrainerClickGenPointScheduling):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.sampling_alpha = 0.1  # sampling alpha 0.1
+
+class trialsTrainerClickGenPointSchedulingSampling04(trialsTrainerClickGenPointScheduling):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.sampling_alpha = 0.4  # sampling alpha 0.1
 
 class trialsTrainerDebug(trialsTrainerClickGenRemLastClass):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,

@@ -766,13 +766,14 @@ class nnUNetDataLoaderClicksGeneratedNoPlace(nnUNetDataLoader):
                  probabilistic_oversampling: bool = False,
                  transforms=None,
                  point_width: float = 1.5,
-                 standard_click_simulation_probability: float = 0.8):
+                 standard_click_simulation_probability: float = 0.8,
+                 sampling_alpha = 0.2):
         super().__init__(data, batch_size, patch_size, final_patch_size, label_manager,
                          oversample_foreground_percent, sampling_probabilities, pad_sides,
                          probabilistic_oversampling, transforms)
         self.point_width = point_width
         self.standard_click_simulation_probability = standard_click_simulation_probability
-
+        self.sampling_alpha = sampling_alpha
 
     def generate_train_batch(self):
         selected_keys = self.get_indices()
@@ -842,7 +843,7 @@ class nnUNetDataLoaderClicksGeneratedNoPlace(nnUNetDataLoader):
                         if np.sum(seg) != 0 and np.sum(helper_seg) == 0:
                             print("lol wat happend here ?")
 
-                        num_pos_clicks, num_neg_clicks = select_num_points_exp()
+                        num_pos_clicks, num_neg_clicks = select_num_points_exp(self.sampling_alpha)
 
                         if np.random.rand() < self.standard_click_simulation_probability:  # 80% chance to use the normal click simulation
                             clicks = simulate_clicks(seg, helper_seg,pos_click_budget=num_pos_clicks,
