@@ -1591,6 +1591,8 @@ class trialsTrainerClickGenPointScheduling(trialsTrainerClickGenAdvanced):
         self.standard_click_simulation_probability = 0.8
         self.increase_every = None
         self.precomputed_point =  build_point(tuple((self.point_width,self.point_width,self.point_width)), use_distance_transform=True, binarize=False).to(self.device)
+        # self.num_iterations_per_epoch = 2
+        # self.num_val_iterations_per_epoch = 2
 
     def get_dataloaders(self):
 
@@ -1816,13 +1818,16 @@ class trialsTrainerClickGenPointSchedulingPW1(trialsTrainerClickGenPointScheduli
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.point_width = 1
-
+        self.precomputed_point = build_point(tuple((self.point_width, self.point_width, self.point_width)),
+                                             use_distance_transform=True, binarize=False).to(self.device)
 
 class trialsTrainerClickGenPointSchedulingPW3(trialsTrainerClickGenPointScheduling):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.point_width = 3
+        self.precomputed_point = build_point(tuple((self.point_width, self.point_width, self.point_width)),
+                                             use_distance_transform=True, binarize=False).to(self.device)
 
 class trialsTrainerClickGenPointSchedulingAdvancedClickGen60(trialsTrainerClickGenPointScheduling):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
