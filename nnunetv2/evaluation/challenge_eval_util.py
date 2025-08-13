@@ -554,7 +554,85 @@ def compute_tumor_burden(prediction_mask, reference_mask):
     return tumor_burden_diff
 
 
-def compute_segmentation_scores(prediction_mask, reference_mask,
+
+def tight_union_bbox(ref_eq, pred_eq):
+    """Return slices for the tight bbox covering ref_eq ∪ pred_eq (both boolean)."""
+    union = ref_eq | pred_eq
+    if not union.any():
+        return None  # nothing to evaluate
+    coords = np.where(union)
+    return tuple(slice(c.min(), c.max() + 1) for c in coords)
+
+def evaluate_per_class_safe(reference_mask, prediction_mask, voxel_spacing):
+    scores = {'dice': [],
+              'jaccard': [],
+              'voe': [],
+              'rvd': [],
+              'assd': [],
+              'rmsd': [],
+              'msd': []
+              }
+
+    # sanity: same shape
+    if reference_mask.shape != prediction_mask.shape:
+        raise ValueError(f"Shape mismatch: {reference_mask.shape} vs {prediction_mask.shape}")
+
+    class_ids = np.union1d(np.unique(reference_mask), np.unique(prediction_mask))
+
+    for obj_id in class_ids:
+        if obj_id == 0:
+            continue  # background
+
+        # boolean masks for this class
+        r_full = (reference_mask == obj_id)
+        p_full = (prediction_mask == obj_id)
+
+        bbox = tight_union_bbox(r_full, p_full)
+
+        if bbox is None:
+            # nothing in either → define as zero dice and penalized ASSD
+            scores['dice'].append(0.0)
+            scores['assd'].append(LARGE)
+            continue
+
+        r = r_full[bbox]
+        p = p_full[bbox]
+
+        if p.any() and r.any():
+            dice = metric.dc(p, r)
+            jaccard = dice / (2. - dice)
+            scores['dice'].append(dice)
+            scores['jaccard'].append(jaccard)
+            scores['voe'].append(1. - jaccard)
+            scores['rvd'].append(metric.ravd(r, p))
+            evalsurf = Surface(p, r,
+                               physical_voxel_spacing=voxel_spacing,
+                               mask_offset=[0., 0., 0.],
+                               reference_offset=[0., 0., 0.])
+            assd = evalsurf.get_average_symmetric_surface_distance()
+            rmsd = evalsurf.get_root_mean_square_symmetric_surface_distance()
+            msd = evalsurf.get_maximum_symmetric_surface_distance()
+            scores['assd'].append(assd)
+            scores['rmsd'].append(rmsd)
+            scores['msd'].append(msd)
+        else:
+            # There are no objects in the prediction, in the reference, or both
+            scores['dice'].append(0)
+            scores['jaccard'].append(0)
+            scores['voe'].append(1.)
+
+            # Surface distance (and volume difference) metrics between the two
+            # masks are meaningless when any one of the masks is empty. Assign
+            # maximum penalty. The average score for these metrics, over all
+            # objects, will thus also not be finite as it also loses meaning.
+            scores['rvd'].append(LARGE)
+            scores['assd'].append(LARGE)
+            scores['rmsd'].append(LARGE)
+            scores['msd'].append(LARGE)
+
+    return scores
+
+def compute_segmentation_scores_wrong(prediction_mask, reference_mask,
                                 voxel_spacing):
     """
     Calculates metrics scores from numpy arrays and returns an dict.
@@ -665,7 +743,7 @@ def process_case(prediction_path_and_ref_dir):
     voxel_spacing = pred_nii.header.get_zooms()
 
     # Compute metrics
-    scores = compute_segmentation_scores(prediction_mask, reference_mask, voxel_spacing)
+    scores = evaluate_per_class_safe(prediction_mask, reference_mask, voxel_spacing)
 
     # Output path
     os.makedirs(output_dir, exist_ok=True)

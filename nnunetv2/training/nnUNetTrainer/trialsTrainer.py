@@ -966,158 +966,158 @@ class trialsTrainerClickGen(nnUNetTrainer):
 
         return {'loss': l.detach().cpu().numpy(), 'tp_hard': tp_hard, 'fp_hard': fp_hard, 'fn_hard': fn_hard}
 
-    def perform_actual_validation_old(self, save_probabilities: bool = False):
-        for i in range(2):
-            if i == 0:
-                continue
-                print("performing val without clicks")
-                use_clicks = False
-            else:
-                print("performing val with clicks")
-                use_clicks = True
-
-            self.set_deep_supervision_enabled(False)
-            self.network.eval()
-
-            if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
-                self.print_to_log_file("WARNING! batch size is 1 during training and torch.compile is enabled. If you "
-                                       "encounter crashes in validation then this is because torch.compile forgets "
-                                       "to trigger a recompilation of the model with deep supervision disabled. "
-                                       "This causes torch.flip to complain about getting a tuple as input. Just rerun the "
-                                       "validation with --val (exactly the same as before) and then it will work. "
-                                       "Why? Because --val triggers nnU-Net to ONLY run validation meaning that the first "
-                                       "forward pass (where compile is triggered) already has deep supervision disabled. "
-                                       "This is exactly what we need in perform_actual_validation")
-
-            predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
-                                        perform_everything_on_device=True, device=self.device, verbose=False,
-                                        verbose_preprocessing=False, allow_tqdm=False)
-            predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
-                                            self.dataset_json, self.__class__.__name__,
-                                            self.inference_allowed_mirroring_axes)
-
-            with multiprocessing.get_context("spawn").Pool(default_num_processes) as segmentation_export_pool:
-                worker_list = [i for i in segmentation_export_pool._pool]
-                if use_clicks:
-                    validation_output_folder = join(self.output_folder, 'validation')
-                else:
-                    validation_output_folder = join(self.output_folder, 'validation_no_clicks')
-                maybe_mkdir_p(validation_output_folder)
-
-                # we cannot use self.get_tr_and_val_datasets() here because we might be DDP and then we have to distribute
-                # the validation keys across the workers.
-                _, val_keys = self.do_split()
-                if self.is_ddp:
-                    last_barrier_at_idx = len(val_keys) // dist.get_world_size() - 1
-
-                    val_keys = val_keys[self.local_rank:: dist.get_world_size()]
-                    # we cannot just have barriers all over the place because the number of keys each GPU receives can be
-                    # different
-
-                dataset_val = nnUNetDatasetBlosc2(self.preprocessed_dataset_folder, val_keys,
-                                                  folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
-                                                  )
-
-                next_stages = self.configuration_manager.next_stage_names
-
-                if next_stages is not None:
-                    _ = [maybe_mkdir_p(join(self.output_folder_base, 'predicted_next_stage', n)) for n in next_stages]
-
-                results = []
-
-                for i, k in enumerate(dataset_val.get_dataset_identifiers()):
-                    proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
-                                                               allowed_num_queued=2)
-                    while not proceed:
-                        sleep(0.1)
-                        proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
-                                                                   allowed_num_queued=2)
-
-                    self.print_to_log_file(f"predicting {k}")
-                    data, seg, seg_org, properties, clicks = dataset_val.load_case_with_clicks(k)
-                    shape = data.shape[1:]
-
-
-
-                    if use_clicks:
-                        clicks = restructure_clicks(clicks)
-                        pos_clicks, neg_clicks = sparse_to_dense_point_nnInteractive(clicks["points"], shape,properties,
-                                                                             sigma=self.point_width)
-
-                    else:
-                        pos_clicks = np.zeros(shape, dtype=np.float32)
-                        neg_clicks = np.zeros(shape, dtype=np.float32)
-
-
-                    clicks_stacked = np.vstack((np.expand_dims(pos_clicks, axis=0), np.expand_dims(neg_clicks, axis=0)))
-                    clicks_stacked = torch.from_numpy(clicks_stacked).float()
-                    data = torch.from_numpy(np.asarray(data)).float()
-                    data = torch.cat((data, clicks_stacked), dim=0)
-
-                    # import napari
-                    # viewer = napari.Viewer()
-                    # viewer.add_image(data[0].numpy(), name='CT')
-                    # viewer.add_image(data[1], name='pos')
-                    # viewer.add_image(data[2], name='neg')
-                    # napari.run()
-
-                    if self.is_cascaded:
-                        data = np.vstack(
-                            (data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels,
-                                                               output_dtype=data.dtype)))
-                    with warnings.catch_warnings():
-                        # ignore 'The given NumPy array is not writable' warning
-                        warnings.simplefilter("ignore")
-                        if type(data) is torch.Tensor:
-                            pass
-                        else:
-                            data = torch.from_numpy(data)
-
-                    self.print_to_log_file(f'{k}, shape {data.shape}, rank {self.local_rank}')
-                    output_filename_truncated = join(validation_output_folder, k)
-
-                    prediction = predictor.predict_sliding_window_return_logits(data)
-                    prediction = prediction.cpu()
-
-                    # this needs to go into background processes
-                    results.append(
-                        segmentation_export_pool.starmap_async(
-                            export_prediction_from_logits, (
-                                (prediction, properties, self.configuration_manager, self.plans_manager,
-                                 self.dataset_json, output_filename_truncated, save_probabilities),
-                            )
-                        )
-                    )
-                    # for debug purposes
-                    # export_prediction(prediction_for_export, properties, self.configuration, self.plans, self.dataset_json,
-                    #              output_filename_truncated, save_probabilities)
-
-                    # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
-                    if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
-                        dist.barrier()
-
-                _ = [r.get() for r in results]
-
-            if self.is_ddp:
-                dist.barrier()
-
-            if self.local_rank == 0:
-                metrics = compute_metrics_on_folder(join(self.preprocessed_dataset_folder_base, 'gt_segmentations'),
-                                                    validation_output_folder,
-                                                    join(validation_output_folder, 'summary.json'),
-                                                    self.plans_manager.image_reader_writer_class(),
-                                                    self.dataset_json["file_ending"],
-                                                    self.label_manager.foreground_regions if self.label_manager.has_regions else
-                                                    self.label_manager.foreground_labels,
-                                                    self.label_manager.ignore_label, chill=True,
-                                                    num_processes=default_num_processes * dist.get_world_size() if
-                                                    self.is_ddp else default_num_processes)
-                self.print_to_log_file("Validation complete", also_print_to_console=True)
-                self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
-                                       also_print_to_console=True)
-
-            self.set_deep_supervision_enabled(True)
-            compute_gaussian.cache_clear()
+    # def perform_actual_validation_old(self, save_probabilities: bool = False):
+    #     for i in range(2):
+    #         if i == 0:
+    #             continue
+    #             print("performing val without clicks")
+    #             use_clicks = False
+    #         else:
+    #             print("performing val with clicks")
+    #             use_clicks = True
+    #
+    #         self.set_deep_supervision_enabled(False)
+    #         self.network.eval()
+    #
+    #         if self.is_ddp and self.batch_size == 1 and self.enable_deep_supervision and self._do_i_compile():
+    #             self.print_to_log_file("WARNING! batch size is 1 during training and torch.compile is enabled. If you "
+    #                                    "encounter crashes in validation then this is because torch.compile forgets "
+    #                                    "to trigger a recompilation of the model with deep supervision disabled. "
+    #                                    "This causes torch.flip to complain about getting a tuple as input. Just rerun the "
+    #                                    "validation with --val (exactly the same as before) and then it will work. "
+    #                                    "Why? Because --val triggers nnU-Net to ONLY run validation meaning that the first "
+    #                                    "forward pass (where compile is triggered) already has deep supervision disabled. "
+    #                                    "This is exactly what we need in perform_actual_validation")
+    #
+    #         predictor = nnUNetPredictor(tile_step_size=0.5, use_gaussian=True, use_mirroring=True,
+    #                                     perform_everything_on_device=True, device=self.device, verbose=False,
+    #                                     verbose_preprocessing=False, allow_tqdm=False)
+    #         predictor.manual_initialization(self.network, self.plans_manager, self.configuration_manager, None,
+    #                                         self.dataset_json, self.__class__.__name__,
+    #                                         self.inference_allowed_mirroring_axes)
+    #
+    #         with multiprocessing.get_context("spawn").Pool(default_num_processes) as segmentation_export_pool:
+    #             worker_list = [i for i in segmentation_export_pool._pool]
+    #             if use_clicks:
+    #                 validation_output_folder = join(self.output_folder, 'validation')
+    #             else:
+    #                 validation_output_folder = join(self.output_folder, 'validation_no_clicks')
+    #             maybe_mkdir_p(validation_output_folder)
+    #
+    #             # we cannot use self.get_tr_and_val_datasets() here because we might be DDP and then we have to distribute
+    #             # the validation keys across the workers.
+    #             _, val_keys = self.do_split()
+    #             if self.is_ddp:
+    #                 last_barrier_at_idx = len(val_keys) // dist.get_world_size() - 1
+    #
+    #                 val_keys = val_keys[self.local_rank:: dist.get_world_size()]
+    #                 # we cannot just have barriers all over the place because the number of keys each GPU receives can be
+    #                 # different
+    #
+    #             dataset_val = nnUNetDatasetBlosc2(self.preprocessed_dataset_folder, val_keys,
+    #                                               folder_with_segs_from_previous_stage=self.folder_with_segs_from_previous_stage,
+    #                                               )
+    #
+    #             next_stages = self.configuration_manager.next_stage_names
+    #
+    #             if next_stages is not None:
+    #                 _ = [maybe_mkdir_p(join(self.output_folder_base, 'predicted_next_stage', n)) for n in next_stages]
+    #
+    #             results = []
+    #
+    #             for i, k in enumerate(dataset_val.get_dataset_identifiers()):
+    #                 proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
+    #                                                            allowed_num_queued=2)
+    #                 while not proceed:
+    #                     sleep(0.1)
+    #                     proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
+    #                                                                allowed_num_queued=2)
+    #
+    #                 self.print_to_log_file(f"predicting {k}")
+    #                 data, seg, seg_org, properties, clicks = dataset_val.load_case_with_clicks(k)
+    #                 shape = data.shape[1:]
+    #
+    #
+    #
+    #                 if use_clicks:
+    #                     clicks = restructure_clicks(clicks)
+    #                     pos_clicks, neg_clicks = sparse_to_dense_point_nnInteractive(clicks["points"], shape,properties,
+    #                                                                          sigma=self.point_width)
+    #
+    #                 else:
+    #                     pos_clicks = np.zeros(shape, dtype=np.float32)
+    #                     neg_clicks = np.zeros(shape, dtype=np.float32)
+    #
+    #
+    #                 clicks_stacked = np.vstack((np.expand_dims(pos_clicks, axis=0), np.expand_dims(neg_clicks, axis=0)))
+    #                 clicks_stacked = torch.from_numpy(clicks_stacked).float()
+    #                 data = torch.from_numpy(np.asarray(data)).float()
+    #                 data = torch.cat((data, clicks_stacked), dim=0)
+    #
+    #                 # import napari
+    #                 # viewer = napari.Viewer()
+    #                 # viewer.add_image(data[0].numpy(), name='CT')
+    #                 # viewer.add_image(data[1], name='pos')
+    #                 # viewer.add_image(data[2], name='neg')
+    #                 # napari.run()
+    #
+    #                 if self.is_cascaded:
+    #                     data = np.vstack(
+    #                         (data, convert_labelmap_to_one_hot(seg[-1], self.label_manager.foreground_labels,
+    #                                                            output_dtype=data.dtype)))
+    #                 with warnings.catch_warnings():
+    #                     # ignore 'The given NumPy array is not writable' warning
+    #                     warnings.simplefilter("ignore")
+    #                     if type(data) is torch.Tensor:
+    #                         pass
+    #                     else:
+    #                         data = torch.from_numpy(data)
+    #
+    #                 self.print_to_log_file(f'{k}, shape {data.shape}, rank {self.local_rank}')
+    #                 output_filename_truncated = join(validation_output_folder, k)
+    #
+    #                 prediction = predictor.predict_sliding_window_return_logits(data)
+    #                 prediction = prediction.cpu()
+    #
+    #                 # this needs to go into background processes
+    #                 results.append(
+    #                     segmentation_export_pool.starmap_async(
+    #                         export_prediction_from_logits, (
+    #                             (prediction, properties, self.configuration_manager, self.plans_manager,
+    #                              self.dataset_json, output_filename_truncated, save_probabilities),
+    #                         )
+    #                     )
+    #                 )
+    #                 # for debug purposes
+    #                 # export_prediction(prediction_for_export, properties, self.configuration, self.plans, self.dataset_json,
+    #                 #              output_filename_truncated, save_probabilities)
+    #
+    #                 # if we don't barrier from time to time we will get nccl timeouts for large datasets. Yuck.
+    #                 if self.is_ddp and i < last_barrier_at_idx and (i + 1) % 20 == 0:
+    #                     dist.barrier()
+    #
+    #             _ = [r.get() for r in results]
+    #
+    #         if self.is_ddp:
+    #             dist.barrier()
+    #
+    #         if self.local_rank == 0:
+    #             metrics = compute_metrics_on_folder(join(self.preprocessed_dataset_folder_base, 'gt_segmentations'),
+    #                                                 validation_output_folder,
+    #                                                 join(validation_output_folder, 'summary.json'),
+    #                                                 self.plans_manager.image_reader_writer_class(),
+    #                                                 self.dataset_json["file_ending"],
+    #                                                 self.label_manager.foreground_regions if self.label_manager.has_regions else
+    #                                                 self.label_manager.foreground_labels,
+    #                                                 self.label_manager.ignore_label, chill=True,
+    #                                                 num_processes=default_num_processes * dist.get_world_size() if
+    #                                                 self.is_ddp else default_num_processes)
+    #             self.print_to_log_file("Validation complete", also_print_to_console=True)
+    #             self.print_to_log_file("Mean Validation Dice: ", (metrics['foreground_mean']["Dice"]),
+    #                                    also_print_to_console=True)
+    #
+    #         self.set_deep_supervision_enabled(True)
+    #         compute_gaussian.cache_clear()
 
     def perform_actual_validation(self, save_probabilities: bool = False):
             for num_clicks in [0,3,7,10]:
@@ -1149,12 +1149,15 @@ class trialsTrainerClickGen(nnUNetTrainer):
                                                 self.dataset_json, self.__class__.__name__,
                                                 self.inference_allowed_mirroring_axes)
 
+                validation_output_folder = join(self.output_folder, 'validation_challenge')
+
+                maybe_mkdir_p(validation_output_folder)
+                # del self.network, predictor
+                # continue
                 with multiprocessing.get_context("spawn").Pool(default_num_processes) as segmentation_export_pool:
                     worker_list = [i for i in segmentation_export_pool._pool]
 
-                    validation_output_folder = join(self.output_folder, 'validation_challenge')
 
-                    maybe_mkdir_p(validation_output_folder)
 
                     # we cannot use self.get_tr_and_val_datasets() here because we might be DDP and then we have to distribute
                     # the validation keys across the workers.
@@ -1171,6 +1174,7 @@ class trialsTrainerClickGen(nnUNetTrainer):
                                                       )
 
                     results = []
+
                     for i, k in enumerate(dataset_val.get_dataset_identifiers()):
                         proceed = not check_workers_alive_and_busy(segmentation_export_pool, worker_list, results,
                                                                    allowed_num_queued=2)
