@@ -36,6 +36,7 @@ from batchgeneratorsv2.transforms.utils.pseudo2d import Convert3DTo2DTransform, 
 from batchgeneratorsv2.transforms.utils.random import RandomTransform
 from batchgeneratorsv2.transforms.utils.remove_label import RemoveLabelTansform
 from batchgeneratorsv2.transforms.utils.seg_to_regions import ConvertSegmentationToRegionsTransform
+from sympy.stats.sampling.sample_scipy import scipy
 from torch import autocast, nn
 from torch import distributed as dist
 from torch._dynamo import OptimizedModule
@@ -1251,6 +1252,16 @@ class trialsTrainerClickGen(nnUNetTrainer):
                                 )
                             )
                         )
+
+                        # import napari
+                        # viewer = napari.Viewer()
+                        # viewer.add_image(data[0].numpy(), name='CT')
+                        # viewer.add_image(scipy.special.softmax(prediction, axis=1), name='predictionsm1')
+                        # viewer.add_image(scipy.special.softmax(prediction, axis=0), name='predictionsm0')
+                        # viewer.add_image(prediction[1], name='prediction1')
+                        # viewer.add_image(data[1], name='pos',colormap='green')
+                        # viewer.add_image(data[2], name='neg',colormap='blue')
+                        # napari.run()
                         # for debug purposes
                         # export_prediction(prediction_for_export, properties, self.configuration, self.plans, self.dataset_json,
                         #              output_filename_truncated, save_probabilities)
@@ -1692,6 +1703,11 @@ class trialsTrainerClickGenPointScheduling(trialsTrainerClickGenAdvanced):
         data = data.to(self.device, non_blocking=True)
         all_data = []
         for b in range(len(data)):
+            interactions = select_interactions_based_on_epochs(interactions=interactions,
+                                                               current_epoch=self.current_epoch,
+                                                               num_epochs=self.num_epochs,
+                                                               increase_every=self.increase_every)
+
             pos_clicks, neg_clicks = place_precomputed_clicks(interactions[b], self.precomputed_point, data.shape[2:],
                                                               self.device)
             all_data.append(torch.cat((data[b], pos_clicks, neg_clicks), dim=0))
@@ -1847,6 +1863,31 @@ class trialsTrainerClickGenPointSchedulingAdvancedClickGen40(trialsTrainerClickG
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.standard_click_simulation_probability = 0.6
 
+class trialsTrainerClickGenPointSchedulingAdvancedClickGen40PW3(trialsTrainerClickGenPointScheduling):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.standard_click_simulation_probability = 0.6
+        self.point_width = 3
+        self.precomputed_point = build_point(tuple((self.point_width, self.point_width, self.point_width)),
+                                             use_distance_transform=True, binarize=False).to(self.device)
+
+class trialsTrainerClickGenPointSchedulingPW4(trialsTrainerClickGenPointScheduling):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.point_width = 4
+        self.precomputed_point = build_point(tuple((self.point_width, self.point_width, self.point_width)),
+                                             use_distance_transform=True, binarize=False).to(self.device)
+
+class trialsTrainerClickGenPointSchedulingPW5(trialsTrainerClickGenPointScheduling):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.point_width = 5
+        self.precomputed_point = build_point(tuple((self.point_width, self.point_width, self.point_width)),
+                                             use_distance_transform=True, binarize=False).to(self.device)
+
 class trialsTrainerClickGenPointSchedulingIncreseEvery100(trialsTrainerClickGenPointScheduling):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
@@ -1973,7 +2014,7 @@ class trialsTrainerDebug(trialsTrainerClickGenRemLastClass):
         return nnUNetTrainer.build_network_architecture(architecture_class_name,
                                                         arch_init_kwargs,
                                                         arch_init_kwargs_req_import,
-                                                        num_input_channels +2 ,  # positive / negative clicks
+                                                        num_input_channels + 2 ,  # positive / negative clicks
                                                         num_output_channels, enable_deep_supervision)
 
 
