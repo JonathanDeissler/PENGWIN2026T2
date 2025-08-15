@@ -43,7 +43,7 @@ class trialsPreprocessor(object):
 
     def run_case_npy(self, data: np.ndarray, seg: Union[np.ndarray, None], helper_seg: Union[np.ndarray, None], properties: dict,
                      plans_manager: PlansManager, configuration_manager: ConfigurationManager,
-                     dataset_json: Union[dict, str]):
+                     dataset_json: Union[dict, str]= None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
         # let's not mess up the inputs!
         data = data.astype(np.float32)  # this creates a copy
         if seg is not None:
