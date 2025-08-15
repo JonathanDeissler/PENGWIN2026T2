@@ -41,9 +41,13 @@ class trialsPreprocessor(object):
         Everything we need is in the plans. Those are given when run() is called
         """
 
-    def run_case_npy(self, data: np.ndarray, seg: Union[np.ndarray, None], helper_seg: Union[np.ndarray, None], properties: dict,
+    # def run_case_npy(self, data: np.ndarray, seg: Union[np.ndarray, None], helper_seg: Union[np.ndarray, None], properties: dict,
+    #                  plans_manager: PlansManager, configuration_manager: ConfigurationManager,
+    #                  dataset_json: Union[dict, str]= None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+    def run_case_npy(self, data: np.ndarray, seg: Union[np.ndarray, None], properties: dict,
                      plans_manager: PlansManager, configuration_manager: ConfigurationManager,
-                     dataset_json: Union[dict, str]= None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+                     dataset_json: Union[dict, str], helper_seg: Union[np.ndarray, None]= None):
+
         # let's not mess up the inputs!
         data = data.astype(np.float32)  # this creates a copy
         if seg is not None:
@@ -159,8 +163,8 @@ class trialsPreprocessor(object):
 
         if self.verbose:
             print(seg_file)
-        data, seg, helper_seg, data_properties = self.run_case_npy(data, seg, helper_seg, data_properties, plans_manager, configuration_manager,
-                                      dataset_json)
+        data, seg, helper_seg, data_properties = self.run_case_npy(data=data, seg=seg, helper_seg=helper_seg, properties=data_properties,plans_manager=plans_manager,configuration_manager=configuration_manager,
+                                      dataset_json=dataset_json)
         return data, seg, helper_seg, data_properties
 
     def run_case_save(self, output_filename_truncated: str, image_files: List[str], seg_file: str,
