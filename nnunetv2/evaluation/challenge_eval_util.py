@@ -346,11 +346,8 @@ def aggregate_group_metrics(group_paths):
         if k not in ['dice', 'assd', 'msd']:
             continue
 
-        values = np.array([
-            float(score[k][0]) if isinstance(score[k][0], (int, np.integer)) else score[k][0]
-            for score in all_scores
-        ])
-        auc = integrate.cumulative_trapezoid(values, np.arange(len(values)))[-1]
+        values = np.array([score[k][0] for score in all_scores])
+        auc = integrate.cumulative_trapezoid(values, np.arange(11))[-1]
         final = values[-1]
         aggregated[k] = {
             "AUC": auc,
@@ -554,85 +551,7 @@ def compute_tumor_burden(prediction_mask, reference_mask):
     return tumor_burden_diff
 
 
-
-def tight_union_bbox(ref_eq, pred_eq):
-    """Return slices for the tight bbox covering ref_eq ∪ pred_eq (both boolean)."""
-    union = ref_eq | pred_eq
-    if not union.any():
-        return None  # nothing to evaluate
-    coords = np.where(union)
-    return tuple(slice(c.min(), c.max() + 1) for c in coords)
-
-def evaluate_per_class_safe(reference_mask, prediction_mask, voxel_spacing):
-    scores = {'dice': [],
-              'jaccard': [],
-              'voe': [],
-              'rvd': [],
-              'assd': [],
-              'rmsd': [],
-              'msd': []
-              }
-
-    # sanity: same shape
-    if reference_mask.shape != prediction_mask.shape:
-        raise ValueError(f"Shape mismatch: {reference_mask.shape} vs {prediction_mask.shape}")
-
-    class_ids = np.union1d(np.unique(reference_mask), np.unique(prediction_mask))
-
-    for obj_id in class_ids:
-        if obj_id == 0:
-            continue  # background
-
-        # boolean masks for this class
-        r_full = (reference_mask == obj_id)
-        p_full = (prediction_mask == obj_id)
-
-        bbox = tight_union_bbox(r_full, p_full)
-
-        if bbox is None:
-            # nothing in either → define as zero dice and penalized ASSD
-            scores['dice'].append(0.0)
-            scores['assd'].append(LARGE)
-            continue
-
-        r = r_full[bbox]
-        p = p_full[bbox]
-
-        if p.any() and r.any():
-            dice = metric.dc(p, r)
-            jaccard = dice / (2. - dice)
-            scores['dice'].append(dice)
-            scores['jaccard'].append(jaccard)
-            scores['voe'].append(1. - jaccard)
-            scores['rvd'].append(metric.ravd(r, p))
-            evalsurf = Surface(p, r,
-                               physical_voxel_spacing=voxel_spacing,
-                               mask_offset=[0., 0., 0.],
-                               reference_offset=[0., 0., 0.])
-            assd = evalsurf.get_average_symmetric_surface_distance()
-            rmsd = evalsurf.get_root_mean_square_symmetric_surface_distance()
-            msd = evalsurf.get_maximum_symmetric_surface_distance()
-            scores['assd'].append(assd)
-            scores['rmsd'].append(rmsd)
-            scores['msd'].append(msd)
-        else:
-            # There are no objects in the prediction, in the reference, or both
-            scores['dice'].append(0)
-            scores['jaccard'].append(0)
-            scores['voe'].append(1.)
-
-            # Surface distance (and volume difference) metrics between the two
-            # masks are meaningless when any one of the masks is empty. Assign
-            # maximum penalty. The average score for these metrics, over all
-            # objects, will thus also not be finite as it also loses meaning.
-            scores['rvd'].append(LARGE)
-            scores['assd'].append(LARGE)
-            scores['rmsd'].append(LARGE)
-            scores['msd'].append(LARGE)
-
-    return scores
-
-def compute_segmentation_scores_wrong(prediction_mask, reference_mask,
+def compute_segmentation_scores(prediction_mask, reference_mask,
                                 voxel_spacing):
     """
     Calculates metrics scores from numpy arrays and returns an dict.
@@ -662,12 +581,7 @@ def compute_segmentation_scores_wrong(prediction_mask, reference_mask,
         # Limit processing to the bounding box containing both the prediction
         # and reference objects.
         target_mask = (reference_mask==obj_id)+(prediction_mask==obj_id)
-        if np.issubdtype(target_mask.dtype, np.bool_) or target_mask.dtype == bool:
-            labeled_mask, _ = ndimage.label(target_mask)
-        else:
-            labeled_mask = target_mask  # assume already labeled
-
-        bounding_box = ndimage.find_objects(labeled_mask)[0]
+        bounding_box = ndimage.find_objects(target_mask)[0]
         p = (prediction_mask==obj_id)[bounding_box]
         r = (reference_mask==obj_id)[bounding_box]
         if np.any(p) and np.any(r):
@@ -707,48 +621,134 @@ def compute_segmentation_scores_wrong(prediction_mask, reference_mask,
 def process_case(prediction_path_and_ref_dir):
     prediction_path, ref_dir, output_dir = prediction_path_and_ref_dir
 
-    # try:
-    #     # Find matching reference path
-    #     base_id = '_'.join(os.path.basename(prediction_path).split('_')[:-1])
-    #     reference_path = os.path.join(ref_dir, base_id + '.nii.gz')
-    #     # Load NIfTI files
-    #     pred_nii = nib.load(prediction_path)
-    #     ref_nii = nib.load(reference_path)
-    #
-    #     prediction_mask = pred_nii.get_fdata()
-    #     reference_mask = ref_nii.get_fdata()
-    #     voxel_spacing = pred_nii.header.get_zooms()
-    #
-    #     # Compute metrics
-    #     scores = compute_segmentation_scores(prediction_mask, reference_mask, voxel_spacing)
-    #
-    #     # Output path
-    #     os.makedirs(output_dir, exist_ok=True)
-    #     base_filename = os.path.basename(prediction_path).replace('.nii.gz', '.json')
-    #     output_path = os.path.join(output_dir, base_filename)
-    #     # Save JSON
-    #     with open(output_path, 'w') as f:
-    #         json.dump(scores, f, indent=2)
-    # except Exception as e:
-    #     print(f"[✗] Failed: {prediction_path} — {e}")
+    try:
+        # Find matching reference path
+        base_id = '_'.join(os.path.basename(prediction_path).split('_')[:-1])
+        reference_path = os.path.join(ref_dir, base_id + '.nii.gz')
+        # Load NIfTI files
+        pred_nii = nib.load(prediction_path)
+        ref_nii = nib.load(reference_path)
 
-    base_id = '_'.join(os.path.basename(prediction_path).split('_')[:-1])
-    reference_path = os.path.join(ref_dir, base_id + '.nii.gz')
-    # Load NIfTI files
-    pred_nii = nib.load(prediction_path)
-    ref_nii = nib.load(reference_path)
+        prediction_mask = pred_nii.get_fdata()
+        reference_mask = ref_nii.get_fdata()
+        voxel_spacing = pred_nii.header.get_zooms()
 
-    prediction_mask = pred_nii.get_fdata()
-    reference_mask = ref_nii.get_fdata()
-    voxel_spacing = pred_nii.header.get_zooms()
+        # Compute metrics
+        scores = compute_segmentation_scores(prediction_mask, reference_mask, voxel_spacing)
 
-    # Compute metrics
-    scores = evaluate_per_class_safe(prediction_mask, reference_mask, voxel_spacing)
+        # Output path
+        os.makedirs(output_dir, exist_ok=True)
+        base_filename = os.path.basename(prediction_path).replace('.nii.gz', '.json')
+        output_path = os.path.join(output_dir, base_filename)
+        # Save JSON
+        with open(output_path, 'w') as f:
+            json.dump(scores, f, indent=2)
+    except Exception as e:
+        print(f"[✗] Failed: {prediction_path} — {e}")
 
-    # Output path
-    os.makedirs(output_dir, exist_ok=True)
-    base_filename = os.path.basename(prediction_path).replace('.nii.gz', '.json')
-    output_path = os.path.join(output_dir, base_filename)
-    # Save JSON
-    with open(output_path, 'w') as f:
-        json.dump(scores, f, indent=2)
+if __name__ == '__main__':
+    test_csv_path = sys.argv[1]
+    predicted_masks_path = sys.argv[2]
+    groundtruth_masks_path = sys.argv[3]
+    metrics_csv_path = sys.argv[4]
+
+    os.makedirs(metrics_csv_path, exist_ok=True)
+
+    cases_csv_path = os.path.join(metrics_csv_path, "per_case_metrics.csv")
+    full_csv_path = os.path.join(metrics_csv_path, "metrics.csv")
+
+    with open(test_csv_path, "r") as csvfile:
+        reader_obj = csv.reader(csvfile)
+        orders = list(reader_obj)
+
+
+    predicted_cases = [os.path.join(predicted_masks_path, f[0]) for f in orders]
+    print(f"{len(predicted_cases)} predicted cases!")
+
+
+    with open(cases_csv_path, mode='w', newline='') as writer_file:
+        writer = csv.writer(writer_file)
+
+        writer.writerow(["Image_gt", "Image_pm", "DSC@AUC", "ASD@AUC", "MSD@AUC", "DSC@Final", "ASD@Final", "MSD@Final"])  # write header row
+
+        for i, predicted_case in enumerate(predicted_cases):
+            image_hash = orders[i][0]
+            prediction_paths = [
+                os.path.join(predicted_case, f)
+                for f in os.listdir(predicted_case)
+                if f.endswith('.nii.gz')
+            ]
+
+            output_dir = os.path.join(metrics_csv_path, 'val_metrics')
+
+            # Bundle paths into a list of tuples
+            input_data = [(path, groundtruth_masks_path, output_dir) for path in sorted(prediction_paths)]
+
+            for case in tqdm(input_data, desc=f'Evaluating case {os.path.basename(predicted_case)}'):
+                process_case(case)
+
+
+            grouped_jsons = group_jsons_by_prefix(output_dir, os.path.basename(predicted_case))
+            output_path = output_dir.replace('val_metrics', 'interactive_metrics')
+            os.makedirs(output_path, exist_ok=True)
+            print(f'\n  Case: {os.path.basename(predicted_case)} ({len(grouped_jsons)} files)')
+            assert len(grouped_jsons) == 11
+            agg = aggregate_group_metrics(grouped_jsons)
+            output_json = os.path.join(output_path, f'{os.path.basename(predicted_case)}.json')
+            with open(output_json, 'w') as f:
+                json.dump(agg, f, indent=2)
+            gt_name = f"{image_hash}"
+            pm_name = f"pred-{image_hash}"
+            # Iterate through each image name and write the corresponding dice scores
+            writer.writerow(
+                [gt_name, pm_name, agg['dice']['AUC'], agg['assd']['AUC'], agg['msd']['AUC'], agg['dice']['Final'], agg['assd']['Final'], agg['msd']['Final'] ])
+            print(f"[✓] Saved: {output_json}")
+
+    final_metric_jsons = [os.path.join(output_path, f) for f in os.listdir(output_path)]
+    assert len(final_metric_jsons) == len(predicted_cases)
+    mean_metrics = {
+        "dice": {
+            "AUC": 0,
+            "Final": 0,
+        },
+        "assd": {
+            "AUC": 0,
+            "Final": 0
+        },
+        "msd": {
+            "AUC": 0,
+            "Final": 0
+        }
+    }
+    for final_metric_json in final_metric_jsons:
+        with open(final_metric_json, 'r') as f:
+            final_metric = json.load(f)
+            for key in mean_metrics:
+                for subkey in mean_metrics[key]:
+                    mean_metrics[key][subkey] += final_metric[key][subkey]
+
+    # Now average
+    num_files = len(final_metric_jsons)
+    for key in mean_metrics:
+        for subkey in mean_metrics[key]:
+            mean_metrics[key][subkey] /= num_files
+
+    final_json = os.path.join(metrics_csv_path, 'final_interactive_metrics.json')
+    with open(final_json, 'w') as f:
+        json.dump(mean_metrics, f, indent=2)
+
+    # Open the CSV file for writing
+    with open(full_csv_path, mode='w', newline='') as file:
+        # Create a CSV writer object
+        writer = csv.writer(file)
+        # Write the headers
+        writer.writerow(['Metric', 'Value'])
+        # Write the metrics
+        writer.writerow([f"DSC@AUC", mean_metrics['dice']['AUC']])  # Writing the value directly without formatting
+        writer.writerow([f"ASD@AUC", mean_metrics['assd']['AUC']])  # Writing the value directly without formatting
+        writer.writerow([f"MSD@AUC", mean_metrics['msd']['AUC']])  # Writing the value directly without formatting
+        writer.writerow([f"DSC@Final", mean_metrics['dice']['Final']])  # Writing the value directly without formatting
+        writer.writerow([f"ASD@Final", mean_metrics['assd']['Final']])  # Writing the value directly without formatting
+        writer.writerow([f"MSD@Final", mean_metrics['msd']['Final']])  # Writing the value directly without formatting
+
+    print(f"[✓] Saved: {final_json}")

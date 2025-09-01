@@ -681,6 +681,7 @@ class trialsTrainerClickGen(nnUNetTrainer):
         self.initial_lr = 1e-3
         self.enable_deep_supervision = False
         self.point_width =1.5
+        self.val_interaction_list = [0,3,7,10]
         # self.num_iterations_per_epoch = 5
         # self.num_val_iterations_per_epoch = 5
 
@@ -1121,7 +1122,8 @@ class trialsTrainerClickGen(nnUNetTrainer):
     #         compute_gaussian.cache_clear()
 
     def perform_actual_validation(self, save_probabilities: bool = False):
-            for num_clicks in [0,3,7,10]:
+
+            for num_clicks in self.val_interaction_list:
 
                 if num_clicks == 0:
                     print("performing val without clicks")
@@ -1405,6 +1407,7 @@ class trialsTrainerClickGenPW3(trialsTrainerClickGen):
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.point_width = 3
+
 
 class trialsTrainerClickGenPW2(trialsTrainerClickGen):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -1849,6 +1852,7 @@ class trialsTrainerClickGenPointSchedulingPW3(trialsTrainerClickGenPointScheduli
         self.point_width = 3
         self.precomputed_point = build_point(tuple((self.point_width, self.point_width, self.point_width)),
                                              use_distance_transform=True, binarize=False).to(self.device)
+        self.val_interaction_list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 class trialsTrainerClickGenPointSchedulingAdvancedClickGen60(trialsTrainerClickGenPointScheduling):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -1879,6 +1883,7 @@ class trialsTrainerClickGenPointSchedulingPW4(trialsTrainerClickGenPointScheduli
         self.point_width = 4
         self.precomputed_point = build_point(tuple((self.point_width, self.point_width, self.point_width)),
                                              use_distance_transform=True, binarize=False).to(self.device)
+        self.val_interaction_list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 class trialsTrainerClickGenPointSchedulingPW5(trialsTrainerClickGenPointScheduling):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
@@ -1887,6 +1892,7 @@ class trialsTrainerClickGenPointSchedulingPW5(trialsTrainerClickGenPointScheduli
         self.point_width = 5
         self.precomputed_point = build_point(tuple((self.point_width, self.point_width, self.point_width)),
                                              use_distance_transform=True, binarize=False).to(self.device)
+        self.val_interaction_list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 class trialsTrainerClickGenPointSchedulingIncreseEvery100(trialsTrainerClickGenPointScheduling):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
