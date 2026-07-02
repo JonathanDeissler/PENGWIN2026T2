@@ -2439,3 +2439,11 @@ class trialsTrainerPengwinFragNNI_debug(trialsTrainerPengwinFragNNI):
         self.num_epochs = 2
         self.num_iterations_per_epoch = 5
         self.num_val_iterations_per_epoch = 2
+
+class trialsTrainerPengwinFragNNI_150ep(trialsTrainerPengwinFragNNI):
+    """Fast smoke-test of ablation C: a handful of iterations/epochs so the full
+    build -> load-weights -> train -> validate -> checkpoint loop runs in ~1-2 min."""
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 150
