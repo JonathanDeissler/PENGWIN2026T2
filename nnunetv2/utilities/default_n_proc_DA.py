@@ -22,7 +22,7 @@ def get_allowed_n_proc_DA():
     else:
         hostname = subprocess.getoutput(['hostname'])
         if hostname in ['Fabian', 'e230-pc012.inet.dkfz-heidelberg.de']:
-            use_this = 8
+            use_this = 1
         elif hostname in ['hdf19-gpu16', 'hdf19-gpu17', 'hdf19-gpu18', 'hdf19-gpu19', 'e230-AMDworkstation']:
             use_this = 16
         elif hostname.startswith('e230-dgx1'):

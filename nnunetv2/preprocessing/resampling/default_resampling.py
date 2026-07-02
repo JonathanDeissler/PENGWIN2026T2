@@ -88,6 +88,22 @@ def resample_data_or_seg_to_spacing(data: np.ndarray,
     return data_reshaped
 
 
+def no_resampling_hack(data: Union[torch.Tensor, np.ndarray],
+                       new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
+                       current_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                       new_spacing: Union[Tuple[float, ...], List[float], np.ndarray],
+                       *args, **kwargs):
+    """
+    Identity 'resampling' used by the nnInteractive ``*_noResampling`` plans: the network
+    operates at the data's native spacing, so preprocessing must NOT resample. Vendored here
+    so this fork can run / fine-tune with the nnInteractive plans (ablation C). Returns the
+    data unchanged (numpy), ignoring the requested ``new_shape``.
+    """
+    if isinstance(data, torch.Tensor):
+        data = data.numpy()
+    return data
+
+
 def resample_data_or_seg_to_shape(data: Union[torch.Tensor, np.ndarray],
                                   new_shape: Union[Tuple[int, ...], List[int], np.ndarray],
                                   current_spacing: Union[Tuple[float, ...], List[float], np.ndarray],

@@ -227,6 +227,16 @@ def simulate_clicks(input_label, input_liver, pos_click_budget=10, neg_click_bud
                 edt_inverted = (np.max(edt) - edt) * (edt > 0)
                 boundary_elements = (edt_inverted == np.max(edt_inverted)) * (labeled_mask > 0)
                 indices = np.array(np.nonzero(boundary_elements)).T  # Shape: (num_true, ndim)
+                # center = np.unravel_index(np.argmax(edt), edt.shape)
+                #
+                # import napari
+                # viewer = napari.Viewer()
+                # viewer.add_image(edt, name='edt')
+                # viewer.add_points(center, name='center', size=2, face_color='red')
+                # viewer.add_image(edt_inverted, name='inverted')
+                # viewer.add_points(indices, name='boundary', size=2, face_color='blue')
+                # napari.run()
+
                 if indices.shape[0] == 0:
                     print("wat?")
                 boundary_click = indices[np.random.choice(indices.shape[0])]
@@ -483,6 +493,7 @@ def sample_point_within_region(mask, edt_weight=0.7):
     score = edt_weight * edt + (1 - edt_weight) * noise
     score *= mask
     idx = np.unravel_index(np.argmax(score), score.shape)
+
     return idx
 
 

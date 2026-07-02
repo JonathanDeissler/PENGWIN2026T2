@@ -466,6 +466,121 @@ class nnUNetDataLoaderClicksGenerated(nnUNetDataLoader):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
 
+class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
+    """
+    On-the-fly fragment-click dataloader for PENGWIN Task 2 (ablation B).
+
+    The on-disk segmentation is a *contiguous instance map* (0 = background, 1..k = fracture
+    fragments; see Dataset458 conversion). Per sample we:
+      1. crop a patch (foreground oversampling picks patches that contain fragments),
+      2. apply the spatial/intensity augmentations,
+      3. pick one random fragment present in the augmented patch as the target,
+      4. simulate a positive click inside it and negative clicks in every *other* fragment
+         (same four strategies the challenge uses),
+      5. render the fg/bg Gaussian heatmaps and concatenate them as 2 extra input channels,
+      6. emit a *binary* target ``(seg == target_fragment)``.
+
+    This is the click-conditioned binary task the baseline fragment model solves, but with
+    fresh clicks every step instead of precomputed channels.
+    """
+    def __init__(self,
+                 data: nnUNetBaseDataset,
+                 batch_size: int,
+                 patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
+                 final_patch_size: Union[List[int], Tuple[int, ...], np.ndarray],
+                 label_manager: LabelManager,
+                 oversample_foreground_percent: float = 0.0,
+                 sampling_probabilities: Union[List[int], Tuple[int, ...], np.ndarray] = None,
+                 pad_sides: Union[List[int], Tuple[int, ...]] = None,
+                 probabilistic_oversampling: bool = False,
+                 transforms=None,
+                 point_width: float = 1.0,
+                 click_layout: str = "pair",
+                 point_radius: float = 4.0):
+        """
+        click_layout:
+          "pair"          -> append 2 channels [fg_gauss, bg_gauss]   (ablation B, ResEnc points net)
+          "nninteractive" -> append 7 interaction channels in nnInteractive order, with the
+                             positive-point channel (slot 3) = fg and negative-point channel
+                             (slot 4) = bg, all others zero. Points rendered exactly like
+                             nnInteractive (distance-transform ball of `point_radius`) so the
+                             pretrained checkpoint transfers. (ablation C)
+        """
+        super().__init__(data, batch_size, patch_size, final_patch_size, label_manager,
+                         oversample_foreground_percent, sampling_probabilities, pad_sides,
+                         probabilistic_oversampling, transforms)
+        assert click_layout in ("pair", "nninteractive")
+        self.point_width = point_width
+        self.click_layout = click_layout
+        self.point_radius = point_radius
+
+    def _build_click_channels(self, shape, fg_click, bg_clicks):
+        """Return a (C_extra, *shape) float32 tensor of click channels for the chosen layout."""
+        from nnunetv2.training.dataloading.pengwin_clicks import render_points_gauss
+        if self.click_layout == "pair":
+            fg = render_points_gauss(shape, [] if fg_click is None else [fg_click], self.point_width)
+            bg = render_points_gauss(shape, bg_clicks, self.point_width)
+            return torch.from_numpy(np.stack([fg, bg], axis=0)).float()
+        # nnInteractive: 7 interaction channels [initSeg, bboxPos, bboxNeg, pointPos, pointNeg, scribPos, scribNeg]
+        from nnunetv2.training.dataloading.nnInteractive_clicks import PointInteraction_stub
+        ch = torch.zeros((7, *shape), dtype=torch.float32)
+        pi = PointInteraction_stub(point_radius=self.point_radius, use_distance_transform=True)
+        if fg_click is not None:
+            ch[3] = pi.place_point(tuple(int(v) for v in fg_click), ch[3], binarize=False)
+        for bc in bg_clicks:
+            ch[4] = pi.place_point(tuple(int(v) for v in bc), ch[4], binarize=False)
+        return ch
+
+    def generate_train_batch(self):
+        from nnunetv2.training.dataloading.pengwin_clicks import sample_fragment_clicks
+        selected_keys = self.get_indices()
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+
+        for j, i in enumerate(selected_keys):
+            force_fg = self.get_do_oversample(j)
+            data, seg, seg_prev, properties = self._data.load_case(i)
+            shape = data.shape[1:]
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            bbox = [[l, u] for l, u in zip(bbox_lbs, bbox_ubs)]
+            data_all[j] = crop_and_pad_nd(data, bbox, 0)
+            seg_all[j] = crop_and_pad_nd(seg, bbox, -1)
+
+        if self.patch_size_was_2d:
+            data_all = data_all[:, :, 0]
+            seg_all = seg_all[:, :, 0]
+
+        images, segs = [], []
+        with torch.no_grad():
+            with threadpool_limits(limits=1, user_api=None):
+                data_all = torch.from_numpy(data_all).float()
+                seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                for b in range(self.batch_size):
+                    tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                    seg_b = tmp['segmentation']  # (1, *patch), instance ids, -1 = padding
+                    inst = seg_b[0].numpy().copy()
+                    inst[inst < 0] = 0  # padding -> background for click sampling
+
+                    target_label, fg_click, bg_clicks = sample_fragment_clicks(inst, strategy=None)
+                    if target_label is None:
+                        # empty patch (rare with fg oversampling): no clicks, empty target
+                        binary = torch.zeros_like(seg_b)
+                    else:
+                        binary = (seg_b == target_label).to(torch.int16)
+
+                    clicks = self._build_click_channels(inst.shape, fg_click, bg_clicks)
+                    images.append(torch.cat((tmp['image'], clicks), dim=0))
+                    segs.append(binary)
+
+                data_all = torch.stack(images)
+                if isinstance(segs[0], list):
+                    seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
+                else:
+                    seg_all = torch.stack(segs)
+                del images, segs
+
+        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+
 
 class nnUNetDataLoaderClicksGeneratedHelper(nnUNetDataLoader):
     def __init__(self,

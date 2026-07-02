@@ -65,7 +65,8 @@ from nnunetv2.training.data_augmentation.custom_transforms.misalign import Misal
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.training.dataloading.data_loader_clicks import nnUNetDataLoaderClicks, nnUNetDataLoaderClicksGenerated, \
     nnUNetDataLoaderClicksGeneratedHelper, nnUNetDataLoaderClicksGeneratedDebug, \
-    nnUNetDataLoaderClicksGeneratedAdvancedGeneration, nnUNetDataLoaderClicksGeneratedNoPlace
+    nnUNetDataLoaderClicksGeneratedAdvancedGeneration, nnUNetDataLoaderClicksGeneratedNoPlace, \
+    nnUNetDataLoaderPengwinFrag
 from nnunetv2.training.dataloading.nnunet_dataset import nnUNetDatasetBlosc2, nnUNetDatasetHelperSeg
 from nnunetv2.training.logging.nnunet_logger import nnUNetLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss, FocalTversky_and_CE_loss
@@ -1892,6 +1893,11 @@ class trialsTrainerClickGenPointSchedulingPW5(trialsTrainerClickGenPointScheduli
         self.point_width = 5
         self.precomputed_point = build_point(tuple((self.point_width, self.point_width, self.point_width)),
                                              use_distance_transform=True, binarize=False).to(self.device)
+        # import napari
+        # viewer = napari.Viewer()
+        # viewer.add_image(self.precomputed_point.detach().cpu().numpy(), name='data')
+        # napari.run()
+
         self.val_interaction_list = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 
 class trialsTrainerClickGenPointSchedulingIncreseEvery100(trialsTrainerClickGenPointScheduling):
@@ -2240,3 +2246,196 @@ class trialsTrainerClickGenOnlyTumorOversample1TverskyLoss(
         super().__init__(plans, configuration, fold, dataset_json, device)
 
         self.oversample_foreground_percent = 1
+
+
+# ======================================================================================
+# PENGWIN 2026 Task 2 (PENGWIN-Interact) -- fragment instance segmentation
+# ======================================================================================
+class trialsTrainerPengwinFrag(trialsTrainerClickGen):
+    """
+    PENGWIN Task 2 fragment model (ablation B): binary, click-conditioned segmentation of a
+    single fracture fragment, with clicks simulated on the fly (see
+    :class:`nnUNetDataLoaderPengwinFrag`). One forward pass per fragment at inference.
+
+    Train on ``Dataset458_PENGWINfragOTF`` whose seg is a contiguous per-case instance map.
+    The dataset declares N>2 labels (one per fragment slot) so nnU-Net computes per-fragment
+    ``class_locations`` for balanced oversampling, but the network output and loss are forced
+    to be *binary* (foreground fragment vs. background).
+    """
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 1000
+        self.point_width = 1.0          # match the challenge click sigma (1.0)
+        self.val_interaction_list = [1]  # single positive click per fragment
+        # heavy fg oversampling: most random patches would otherwise miss the small fragments
+        self.oversample_foreground_percent = 0.66
+        # click-channel layout for the dataloader: "pair" (CT+fg+bg, +2 ch) is the default;
+        # the nnInteractive warm-start subclass switches this to "nninteractive" (+7 ch).
+        self.click_layout = "pair"
+        self.point_radius = 4.0
+
+    @staticmethod
+    def build_network_architecture(architecture_class_name: str,
+                                   arch_init_kwargs: dict,
+                                   arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+                                   num_input_channels: int,
+                                   num_output_channels: int,
+                                   enable_deep_supervision: bool = True) -> nn.Module:
+        architecture_class_name = "nnunetv2.architecture.ResidualEncoderUNetPoints.ResidualEncoderUNetPoints"
+        # +2 input channels (fg/bg click heatmaps); force BINARY output regardless of how many
+        # instance-label slots the dataset declares.
+        return nnUNetTrainer.build_network_architecture(architecture_class_name,
+                                                        arch_init_kwargs,
+                                                        arch_init_kwargs_req_import,
+                                                        num_input_channels + 2,
+                                                        2,
+                                                        enable_deep_supervision)
+
+    def get_dataloaders(self):
+        if self.dataset_class is None:
+            self.dataset_class = nnUNetDatasetBlosc2(self.preprocessed_dataset_folder)
+
+        patch_size = self.configuration_manager.patch_size
+        deep_supervision_scales = self._get_deep_supervision_scales()
+        (rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size,
+         mirror_axes) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+
+        tr_transforms = self.get_training_transforms(
+            patch_size, rotation_for_DA, deep_supervision_scales, mirror_axes, do_dummy_2d_data_aug,
+            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+            is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
+            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+            ignore_label=self.label_manager.ignore_label)
+        val_transforms = self.get_validation_transforms(
+            deep_supervision_scales, is_cascaded=self.is_cascaded,
+            foreground_labels=self.label_manager.foreground_labels,
+            regions=self.label_manager.foreground_regions if self.label_manager.has_regions else None,
+            ignore_label=self.label_manager.ignore_label)
+
+        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
+
+        dl_tr = nnUNetDataLoaderPengwinFrag(
+            dataset_tr, self.batch_size, initial_patch_size, self.configuration_manager.patch_size,
+            self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent,
+            sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
+            probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width,
+            click_layout=self.click_layout, point_radius=self.point_radius)
+        dl_val = nnUNetDataLoaderPengwinFrag(
+            dataset_val, self.batch_size, self.configuration_manager.patch_size,
+            self.configuration_manager.patch_size, self.label_manager,
+            oversample_foreground_percent=self.oversample_foreground_percent,
+            sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
+            probabilistic_oversampling=self.probabilistic_oversampling, point_width=self.point_width,
+            click_layout=self.click_layout, point_radius=self.point_radius)
+
+        allowed_num_processes = get_allowed_n_proc_DA()
+        if allowed_num_processes == 0:
+            mt_gen_train = SingleThreadedAugmenter(dl_tr, None)
+            mt_gen_val = SingleThreadedAugmenter(dl_val, None)
+        else:
+            mt_gen_train = NonDetMultiThreadedAugmenter(
+                data_loader=dl_tr, transform=None, num_processes=allowed_num_processes,
+                num_cached=max(6, allowed_num_processes // 2), seeds=None,
+                pin_memory=self.device.type == 'cuda', wait_time=0.002)
+            mt_gen_val = NonDetMultiThreadedAugmenter(
+                data_loader=dl_val, transform=None, num_processes=max(1, allowed_num_processes // 2),
+                num_cached=max(3, allowed_num_processes // 4), seeds=None,
+                pin_memory=self.device.type == 'cuda', wait_time=0.002)
+        _ = next(mt_gen_train)
+        _ = next(mt_gen_val)
+        return mt_gen_train, mt_gen_val
+
+    def perform_actual_validation(self, save_probabilities: bool = False):
+        # The inherited (LiTS-specific) routine expects 'lesion'/'background' clicks and the
+        # challenge_eval_util metrics, which do not apply to PENGWIN. Per-fragment instance
+        # validation is done out-of-band with the pengwin_inference container + the official
+        # PENGWIN evaluation. The online pseudo-Dice (validation_step) already tracks progress.
+        self.print_to_log_file("perform_actual_validation skipped for PENGWIN fragment trainer "
+                               "(evaluate with the pengwin_inference container + PENGWIN eval code).")
+
+
+class trialsTrainerPengwinFragTversky(trialsTrainerPengwinFrag):
+    """As :class:`trialsTrainerPengwinFrag` but with a Focal-Tversky + CE loss, which copes
+    better with the small, imbalanced fracture fragments."""
+    def _build_loss(self):
+        loss = FocalTversky_and_CE_loss(
+            {'batch_dice': self.configuration_manager.batch_dice, 'smooth': 0, 'do_bg': False,
+             'ddp': self.is_ddp, 'gamma': 1.3, 'alpha': 0.7, 'beta': 0.3},
+            {}, weight_ce=1, weight_dice=1, ignore_label=self.label_manager.ignore_label,
+            dice_class=MemoryEfficientSoftDiceLoss)
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            weights[-1] = 0
+            weights = weights / weights.sum()
+            loss = DeepSupervisionWrapper(loss, weights)
+        return loss
+
+
+class trialsTrainerPengwinFragNNI(trialsTrainerPengwinFrag):
+    """
+    PENGWIN fragment model warm-started from the released **nnInteractive v1.0** checkpoint
+    (ablation C, recommended). nnInteractive is an object-agnostic point-promptable ResEnc-L
+    net whose input is ``image + 7 interaction channels`` and whose head is already binary --
+    a perfect fit for the per-fragment task.
+
+    Usage (the network/preprocessing MUST match the checkpoint, so use the nnInteractive
+    plans transferred onto the fragment dataset):
+
+        # 1) transfer the nnInteractive plans onto the fragment dataset (one-off)
+        nnUNetv2_move_plans_between_datasets -s 225 -t 458 \\
+            -sp nnUNetResEncUNetLPlans_noResampling -tp nnUNetResEncUNetLPlans_noResampling
+        nnUNetv2_preprocess -d 458 -plans_name nnUNetResEncUNetLPlans_noResampling -c 3d_fullres_ps192
+
+        # 2) fine-tune, loading the pretrained checkpoint
+        nnUNetv2_train 458 3d_fullres_ps192 0 -tr trialsTrainerPengwinFragNNI \\
+            -p nnUNetResEncUNetLPlans_noResampling \\
+            -pretrained_weights ~/.nninteractive/models/nnInteractive_v1.0/fold_0/checkpoint_final.pth
+
+    The pretrained net is identical (8-in / 2-out / same ResEnc arch) so *all* weights load,
+    including the prompt-reading stem and the seg head. As a convenience, if
+    ``-pretrained_weights`` is not passed, set env var ``PENGWIN_NNI_PRETRAINED`` to the
+    checkpoint path and it will be loaded after initialization.
+    """
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.click_layout = "nninteractive"
+        self.point_radius = 4.0          # matches nnInteractive inference_session_class.json
+        self.initial_lr = 1e-4           # gentle fine-tuning of pretrained weights
+
+    @staticmethod
+    def build_network_architecture(architecture_class_name: str,
+                                   arch_init_kwargs: dict,
+                                   arch_init_kwargs_req_import: Union[List[str], Tuple[str, ...]],
+                                   num_input_channels: int,
+                                   num_output_channels: int,
+                                   enable_deep_supervision: bool = True) -> nn.Module:
+        # Keep the architecture from the (nnInteractive) plans -- do NOT force
+        # ResidualEncoderUNetPoints -- so the pretrained checkpoint's keys match exactly.
+        return nnUNetTrainer.build_network_architecture(architecture_class_name,
+                                                        arch_init_kwargs,
+                                                        arch_init_kwargs_req_import,
+                                                        num_input_channels + 7,  # nnInteractive layout
+                                                        2,                       # binary fragment head
+                                                        enable_deep_supervision)
+
+    def initialize(self):
+        super().initialize()
+        ckpt = os.environ.get("PENGWIN_NNI_PRETRAINED")
+        if ckpt is not None and os.path.isfile(ckpt):
+            from nnunetv2.run.load_pretrained_weights import load_pretrained_weights
+            self.print_to_log_file(f"Loading nnInteractive pretrained weights from {ckpt}")
+            load_pretrained_weights(self.network, ckpt, verbose=True)
+
+
+class trialsTrainerPengwinFragNNI_debug(trialsTrainerPengwinFragNNI):
+    """Fast smoke-test of ablation C: a handful of iterations/epochs so the full
+    build -> load-weights -> train -> validate -> checkpoint loop runs in ~1-2 min."""
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 2
+        self.num_iterations_per_epoch = 5
+        self.num_val_iterations_per_epoch = 2
