@@ -97,3 +97,7 @@ build-backend = "setuptools.build_meta"
 skip = '.git,*.pdf,*.svg'
 #
 # ignore-words-list = ''
+
+
+[tool.setuptools.packages.find]
+include = ["nnunetv2*"]
