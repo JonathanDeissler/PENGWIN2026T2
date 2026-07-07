@@ -32,19 +32,28 @@ def keep_component_overlapping_click(pred_mask: np.ndarray, fg_heatmap: np.ndarr
     return (cc == best).astype(np.uint8)
 
 
-def keep_component_containing_point(pred_mask: np.ndarray, point_zyx) -> np.ndarray:
-    """Keep the connected component that contains the click voxel. If the click is not inside
-    any predicted foreground (model missed), fall back to the largest component."""
+def keep_component_containing_point(pred_mask: np.ndarray, point_zyx, search_radius: int = 6) -> np.ndarray:
+    """Keep the connected component the click belongs to. If the exact click voxel is not
+    inside any predicted foreground (common for boundary / off-centre clicks), pick the
+    component that dominates a small ball around the click (i.e. the *nearest* fragment) --
+    NOT the globally largest one, which for an edge click is often the wrong (bigger) fragment
+    and causes two clicks to collapse onto one fragment."""
     binary = pred_mask > 0
     if not binary.any():
         return np.zeros_like(pred_mask, dtype=np.uint8)
     cc, n = cc3d.connected_components(binary, connectivity=26, return_N=True)
     z, y, x = (int(v) for v in point_zyx)
-    cid = int(cc[z, y, x]) if (0 <= z < cc.shape[0] and 0 <= y < cc.shape[1] and 0 <= x < cc.shape[2]) else 0
+    in_bounds = 0 <= z < cc.shape[0] and 0 <= y < cc.shape[1] and 0 <= x < cc.shape[2]
+    cid = int(cc[z, y, x]) if in_bounds else 0
+    if cid == 0 and in_bounds:
+        r = search_radius
+        sub = cc[max(0, z - r):z + r + 1, max(0, y - r):y + r + 1, max(0, x - r):x + r + 1]
+        vals = sub[sub > 0]
+        if vals.size:
+            cid = int(np.bincount(vals).argmax())          # nearest component around the click
     if cid == 0:
-        sizes = np.bincount(cc.ravel())
-        sizes[0] = 0
-        cid = int(np.argmax(sizes))
+        sizes = np.bincount(cc.ravel()); sizes[0] = 0
+        cid = int(np.argmax(sizes))                          # last resort: largest
     return (cc == cid).astype(np.uint8)
 
 

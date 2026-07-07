@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from medpy import metric
+try:
+    from medpy import metric  # only used by the LiTS-style scoring functions below
+except ModuleNotFoundError:  # optional dep; keep this module importable (e.g. in the inference container)
+    metric = None
 import numpy as np
 from scipy import ndimage
 import argparse

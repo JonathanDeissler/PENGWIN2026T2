@@ -496,7 +496,8 @@ class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
                  transforms=None,
                  point_width: float = 1.0,
                  click_layout: str = "pair",
-                 point_radius: float = 4.0):
+                 point_radius: float = 4.0,
+                 strategy_weights: dict = None):
         """
         click_layout:
           "pair"          -> append 2 channels [fg_gauss, bg_gauss]   (ablation B, ResEnc points net)
@@ -505,6 +506,9 @@ class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
                              (slot 4) = bg, all others zero. Points rendered exactly like
                              nnInteractive (distance-transform ball of `point_radius`) so the
                              pretrained checkpoint transfers. (ablation C)
+        strategy_weights: optional {strategy_name: weight} to bias which of the 4 click strategies
+                          is simulated per sample (e.g. {"boundary_internal_margin": 1.0} for a
+                          boundary specialist). None -> uniform over all 4.
         """
         super().__init__(data, batch_size, patch_size, final_patch_size, label_manager,
                          oversample_foreground_percent, sampling_probabilities, pad_sides,
@@ -513,6 +517,14 @@ class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
         self.point_width = point_width
         self.click_layout = click_layout
         self.point_radius = point_radius
+        self.strategy_weights = strategy_weights
+
+    def _pick_strategy(self):
+        if not self.strategy_weights:
+            return None  # uniform random inside sample_fragment_clicks
+        names = list(self.strategy_weights)
+        w = np.array([self.strategy_weights[n] for n in names], dtype=np.float64)
+        return names[int(np.random.choice(len(names), p=w / w.sum()))]
 
     def _build_click_channels(self, shape, fg_click, bg_clicks):
         """Return a (C_extra, *shape) float32 tensor of click channels for the chosen layout."""
@@ -561,7 +573,7 @@ class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
                     inst = seg_b[0].numpy().copy()
                     inst[inst < 0] = 0  # padding -> background for click sampling
 
-                    target_label, fg_click, bg_clicks = sample_fragment_clicks(inst, strategy=None)
+                    target_label, fg_click, bg_clicks = sample_fragment_clicks(inst, strategy=self._pick_strategy())
                     if target_label is None:
                         # empty patch (rare with fg oversampling): no clicks, empty target
                         binary = torch.zeros_like(seg_b)
