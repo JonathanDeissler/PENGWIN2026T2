@@ -116,6 +116,7 @@ from nnunetv2.training.dataloading.data_loader_clicks import (
     nnUNetDataLoaderClicksGeneratedAdvancedGeneration,
     nnUNetDataLoaderClicksGeneratedNoPlace,
     nnUNetDataLoaderPengwinFrag,
+    nnUNetDataLoaderPengwinMulti,
 )
 from nnunetv2.training.dataloading.nnunet_dataset import (
     nnUNetDatasetBlosc2,
@@ -3496,3 +3497,111 @@ class trialsTrainerPengwinFragNNIBoundary_250ep(trialsTrainerPengwinFragNNI):
         self.num_epochs = 250
         self.initial_lr = 1e-4  # gentle fine-tune
         self.strategy_weights = {"boundary_internal_margin": 1.0}
+
+
+# ======================================================================================
+# Route 3: joint prompt-indexed MULTI-INSTANCE model (all fragments in one pass)
+# ======================================================================================
+class trialsTrainerPengwinMulti(nnUNetTrainer):
+    """
+    Segments ALL clicked fragments jointly in a single forward pass. Input = CT + Nmax click
+    channels (one per fragment click); output = Nmax+1 semantic classes (bg + one slot per
+    click), softmax so every voxel goes to exactly one fragment. Trained on Dataset458 (whose
+    dataset.json declares background + frag_1..Nmax), with fragments assigned to output slots by
+    a random permutation each step (see nnUNetDataLoaderPengwinMulti) so all slots train
+    uniformly. Nmax is taken from the dataset (num classes - 1). Deep supervision off.
+    """
+    os.environ["STEM"] = "trials"
+
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 1000
+        self.initial_lr = 1e-3
+        self.enable_deep_supervision = False
+        self.point_width = 1.0
+
+    @staticmethod
+    def build_network_architecture(architecture_class_name, arch_init_kwargs,
+                                   arch_init_kwargs_req_import, num_input_channels,
+                                   num_output_channels, enable_deep_supervision=True) -> nn.Module:
+        # +Nmax click channels (Nmax = num_output_channels - 1); keep the plans architecture.
+        return nnUNetTrainer.build_network_architecture(
+            architecture_class_name, arch_init_kwargs, arch_init_kwargs_req_import,
+            num_input_channels + (num_output_channels - 1), num_output_channels,
+            enable_deep_supervision)
+
+    def _build_loss(self):
+        loss = DC_and_CE_loss({'batch_dice': self.configuration_manager.batch_dice, 'smooth': 0,
+                               'do_bg': False, 'ddp': self.is_ddp}, {}, weight_ce=1, weight_dice=1,
+                              ignore_label=self.label_manager.ignore_label,
+                              dice_class=MemoryEfficientSoftDiceLoss)
+        return loss
+
+    def get_dataloaders(self):
+        if self.dataset_class is None:
+            self.dataset_class = nnUNetDatasetBlosc2(self.preprocessed_dataset_folder)
+        patch_size = self.configuration_manager.patch_size
+        (rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size,
+         mirror_axes) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+        tr_transforms = self.get_training_transforms(
+            patch_size, rotation_for_DA, None, mirror_axes, do_dummy_2d_data_aug,
+            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+            is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
+            regions=None, ignore_label=self.label_manager.ignore_label)
+        val_transforms = self.get_validation_transforms(
+            None, is_cascaded=self.is_cascaded,
+            foreground_labels=self.label_manager.foreground_labels,
+            regions=None, ignore_label=self.label_manager.ignore_label)
+        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
+        nmax = self.label_manager.num_segmentation_heads - 1
+        dl_tr = nnUNetDataLoaderPengwinMulti(
+            dataset_tr, self.batch_size, initial_patch_size, self.configuration_manager.patch_size,
+            self.label_manager, oversample_foreground_percent=self.oversample_foreground_percent,
+            sampling_probabilities=None, pad_sides=None, transforms=tr_transforms,
+            probabilistic_oversampling=self.probabilistic_oversampling,
+            point_width=self.point_width, max_instances=nmax)
+        dl_val = nnUNetDataLoaderPengwinMulti(
+            dataset_val, self.batch_size, self.configuration_manager.patch_size,
+            self.configuration_manager.patch_size, self.label_manager,
+            oversample_foreground_percent=self.oversample_foreground_percent,
+            sampling_probabilities=None, pad_sides=None, transforms=val_transforms,
+            probabilistic_oversampling=self.probabilistic_oversampling,
+            point_width=self.point_width, max_instances=nmax)
+        allowed_num_processes = get_allowed_n_proc_DA()
+        if allowed_num_processes == 0:
+            return SingleThreadedAugmenter(dl_tr, None), SingleThreadedAugmenter(dl_val, None)
+        mt_gen_train = NonDetMultiThreadedAugmenter(
+            data_loader=dl_tr, transform=None, num_processes=allowed_num_processes,
+            num_cached=max(6, allowed_num_processes // 2), seeds=None,
+            pin_memory=self.device.type == 'cuda', wait_time=0.002)
+        mt_gen_val = NonDetMultiThreadedAugmenter(
+            data_loader=dl_val, transform=None, num_processes=max(1, allowed_num_processes // 2),
+            num_cached=max(3, allowed_num_processes // 4), seeds=None,
+            pin_memory=self.device.type == 'cuda', wait_time=0.002)
+        _ = next(mt_gen_train); _ = next(mt_gen_val)
+        return mt_gen_train, mt_gen_val
+
+    def perform_actual_validation(self, save_probabilities: bool = False):
+        self.print_to_log_file("perform_actual_validation skipped for the PENGWIN multi-instance "
+                               "trainer (evaluate with the pengwin_inference multi pipeline).")
+
+
+class trialsTrainerPengwinMultiNNI(trialsTrainerPengwinMulti):
+    """Multi-instance, warm-started from nnInteractive (noResampling plans). Only weights whose
+    shapes match load -- the stem (input channels differ: 1+Nmax vs 8) and seg head (Nmax+1 vs 2)
+    are reinitialised, the encoder/decoder body transfers. Pass -pretrained_weights to the
+    nnInteractive checkpoint (load_pretrained_weights skips shape-mismatched layers)."""
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.initial_lr = 3e-4
+
+
+class trialsTrainerPengwinMulti_debug(trialsTrainerPengwinMulti):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 2
+        self.num_iterations_per_epoch = 5
+        self.num_val_iterations_per_epoch = 2

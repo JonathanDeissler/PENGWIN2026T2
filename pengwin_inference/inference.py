@@ -84,11 +84,16 @@ def _predict_and_merge_grid(frag: FragmentPredictor, ct_data, properties,
                      earlier on overlap (ANATOMY_ORDER). Order decides contested voxels.
       "argmax"    -> probability competition: each contested voxel goes to the fragment with the
                      highest foreground probability (online argmax over `best_prob`/`best_label`).
+      "ownership" -> keep each fragment's binary mask, but resolve OVERLAPS by nearest click:
+                     a voxel claimed by >1 fragment goes to the one whose click is closest
+                     (Voronoi tie-break). Fixes the duplicate/collapse cases without touching
+                     non-contested voxels.
     """
     grid_shape = tuple(ct_data.shape[1:])
     all_clicks = [c for frags in per_anatomy_frags.values() for fr in frags for c in fr]
     merged = np.zeros(grid_shape, dtype=np.uint16)
     best_prob = np.zeros(grid_shape, dtype=np.float32) if assembly == "argmax" else None
+    owner_dist = np.full(grid_shape, np.inf, dtype=np.float32) if assembly == "ownership" else None
 
     for aid in ANATOMY_ORDER:
         frags = per_anatomy_frags.get(aid, [])
@@ -108,7 +113,22 @@ def _predict_and_merge_grid(frag: FragmentPredictor, ct_data, properties,
             else:
                 seg_grid, grid_click = frag.predict_fragment(ct_data, properties, fg_list, bg)
                 m = keep_component_containing_point(seg_grid, grid_click)
-                merged[m > 0] = label
+                if assembly == "ownership":
+                    coords = np.argwhere(m)
+                    if coords.size == 0:
+                        del seg_grid, m; continue
+                    sl = tuple(slice(int(coords[:, i].min()), int(coords[:, i].max()) + 1) for i in range(3))
+                    cz, cy, cx = grid_click
+                    zs = (np.arange(sl[0].start, sl[0].stop) - cz)[:, None, None]
+                    ys = (np.arange(sl[1].start, sl[1].stop) - cy)[None, :, None]
+                    xs = (np.arange(sl[2].start, sl[2].stop) - cx)[None, None, :]
+                    d = np.sqrt((zs ** 2 + ys ** 2 + xs ** 2).astype(np.float32))
+                    take = (m[sl] > 0) & (d < owner_dist[sl])   # only claim where this click is nearer
+                    merged[sl][take] = label
+                    owner_dist[sl][take] = d[take]
+                    del d, take
+                else:  # overwrite
+                    merged[m > 0] = label
                 del seg_grid, m
     return merged
 

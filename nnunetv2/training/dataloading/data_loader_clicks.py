@@ -594,6 +594,89 @@ class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
 
+class nnUNetDataLoaderPengwinMulti(nnUNetDataLoader):
+    """
+    Joint prompt-indexed MULTI-INSTANCE dataloader (Route 3). One forward pass segments ALL
+    clicked fragments at once: input = CT + ``max_instances`` click channels (one per fragment
+    click); output = ``max_instances + 1`` classes (bg + one slot per click), trained with a
+    softmax so every voxel is assigned to exactly one fragment -> the fracture becomes a learned
+    decision boundary (no per-fragment merging).
+
+    Fragments are assigned to output slots by a RANDOM permutation each iteration, so all slots
+    train uniformly and the model becomes permutation-equivariant (class i <-> click channel i).
+    """
+    def __init__(self,
+                 data: nnUNetBaseDataset,
+                 batch_size: int,
+                 patch_size,
+                 final_patch_size,
+                 label_manager: LabelManager,
+                 oversample_foreground_percent: float = 0.0,
+                 sampling_probabilities=None,
+                 pad_sides=None,
+                 probabilistic_oversampling: bool = False,
+                 transforms=None,
+                 point_width: float = 1.0,
+                 max_instances: int = 30):
+        super().__init__(data, batch_size, patch_size, final_patch_size, label_manager,
+                         oversample_foreground_percent, sampling_probabilities, pad_sides,
+                         probabilistic_oversampling, transforms)
+        self.point_width = point_width
+        self.max_instances = max_instances
+
+    def generate_train_batch(self):
+        from nnunetv2.training.dataloading.pengwin_clicks import (
+            simulate_click_in_fragment, render_points_gauss, STRATEGIES,
+        )
+        selected_keys = self.get_indices()
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+
+        for j, i in enumerate(selected_keys):
+            force_fg = self.get_do_oversample(j)
+            data, seg, seg_prev, properties = self._data.load_case(i)
+            shape = data.shape[1:]
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            bbox = [[l, u] for l, u in zip(bbox_lbs, bbox_ubs)]
+            data_all[j] = crop_and_pad_nd(data, bbox, 0)
+            seg_all[j] = crop_and_pad_nd(seg, bbox, -1)
+
+        if self.patch_size_was_2d:
+            data_all = data_all[:, :, 0]
+            seg_all = seg_all[:, :, 0]
+
+        images, segs = [], []
+        with torch.no_grad():
+            with threadpool_limits(limits=1, user_api=None):
+                data_all = torch.from_numpy(data_all).float()
+                seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                for b in range(self.batch_size):
+                    tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                    seg_b = tmp['segmentation']
+                    inst = seg_b[0].numpy().copy()
+                    inst[inst < 0] = 0
+                    ids = [int(v) for v in np.unique(inst) if v > 0][: self.max_instances]
+
+                    # random distinct output slot (1..max_instances) per present fragment
+                    slots = (np.random.permutation(self.max_instances)[: len(ids)] + 1).tolist()
+                    target = np.zeros(inst.shape, dtype=np.int16)
+                    clicks = np.zeros((self.max_instances, *inst.shape), dtype=np.float32)
+                    for fid, slot in zip(ids, slots):
+                        m = inst == fid
+                        target[m] = slot
+                        c = simulate_click_in_fragment(m, STRATEGIES[np.random.randint(len(STRATEGIES))])
+                        clicks[slot - 1] = render_points_gauss(inst.shape, [c], self.point_width)
+
+                    images.append(torch.cat((tmp['image'], torch.from_numpy(clicks).float()), dim=0))
+                    segs.append(torch.from_numpy(target[None]))
+
+                data_all = torch.stack(images)
+                seg_all = torch.stack(segs)
+                del images, segs
+
+        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+
+
 class nnUNetDataLoaderClicksGeneratedHelper(nnUNetDataLoader):
     def __init__(self,
                  data: nnUNetBaseDataset,
