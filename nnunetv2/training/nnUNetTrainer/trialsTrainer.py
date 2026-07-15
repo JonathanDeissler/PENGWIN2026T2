@@ -117,6 +117,7 @@ from nnunetv2.training.dataloading.data_loader_clicks import (
     nnUNetDataLoaderClicksGeneratedNoPlace,
     nnUNetDataLoaderPengwinFrag,
     nnUNetDataLoaderPengwinMulti,
+    nnUNetDataLoaderPengwinFragStrat,
 )
 from nnunetv2.training.dataloading.nnunet_dataset import (
     nnUNetDatasetBlosc2,
@@ -3599,6 +3600,115 @@ class trialsTrainerPengwinMultiNNI(trialsTrainerPengwinMulti):
 
 
 class trialsTrainerPengwinMulti_debug(trialsTrainerPengwinMulti):
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 2
+        self.num_iterations_per_epoch = 5
+        self.num_val_iterations_per_epoch = 2
+
+
+# ======================================================================================
+# Strategy-multiplexed, pruned-stem fragment model (per-fragment binary)
+# ======================================================================================
+class trialsTrainerPengwinFragStrat(trialsTrainerPengwinFragNNI):
+    """
+    Per-fragment binary model with a SEPARATE ⊕/⊖ point-channel pair per click strategy
+    (4 strategies -> 8 point channels; input = CT + 8 = 9). The click's strategy is encoded by
+    which channel it lands in, so the network can specialise per strategy (e.g. boundary clicks).
+
+    Warm-started from nnInteractive by STEM SURGERY: the unused interaction channels
+    (scribble / box / prev-seg) are pruned, and nnInteractive's learned point⊕ / point⊖ conv
+    weights are *replicated* into all four strategy channels; the encoder/decoder body and the
+    binary head transfer unchanged. Point the checkpoint via env PENGWIN_NNI_PRETRAINED (NOT
+    -pretrained_weights, whose loader can't reshape the stem).
+    """
+    N_STRAT = 4
+
+    @staticmethod
+    def build_network_architecture(architecture_class_name, arch_init_kwargs,
+                                   arch_init_kwargs_req_import, num_input_channels,
+                                   num_output_channels, enable_deep_supervision=True) -> nn.Module:
+        # keep the (nnInteractive) plans architecture; +2*N_STRAT point channels, binary head
+        return nnUNetTrainer.build_network_architecture(
+            architecture_class_name, arch_init_kwargs, arch_init_kwargs_req_import,
+            num_input_channels + 2 * trialsTrainerPengwinFragStrat.N_STRAT, 2,
+            enable_deep_supervision)
+
+    def get_dataloaders(self):
+        if self.dataset_class is None:
+            self.dataset_class = nnUNetDatasetBlosc2(self.preprocessed_dataset_folder)
+        patch_size = self.configuration_manager.patch_size
+        (rotation_for_DA, do_dummy_2d_data_aug, initial_patch_size,
+         mirror_axes) = self.configure_rotation_dummyDA_mirroring_and_inital_patch_size()
+        tr_transforms = self.get_training_transforms(
+            patch_size, rotation_for_DA, None, mirror_axes, do_dummy_2d_data_aug,
+            use_mask_for_norm=self.configuration_manager.use_mask_for_norm,
+            is_cascaded=self.is_cascaded, foreground_labels=self.label_manager.foreground_labels,
+            regions=None, ignore_label=self.label_manager.ignore_label)
+        val_transforms = self.get_validation_transforms(
+            None, is_cascaded=self.is_cascaded,
+            foreground_labels=self.label_manager.foreground_labels,
+            regions=None, ignore_label=self.label_manager.ignore_label)
+        dataset_tr, dataset_val = self.get_tr_and_val_datasets()
+        mk = lambda ds, tf, ps: nnUNetDataLoaderPengwinFragStrat(
+            ds, self.batch_size, ps, self.configuration_manager.patch_size, self.label_manager,
+            oversample_foreground_percent=self.oversample_foreground_percent,
+            sampling_probabilities=None, pad_sides=None, transforms=tf,
+            probabilistic_oversampling=self.probabilistic_oversampling,
+            point_width=self.point_width, point_radius=self.point_radius,
+            strategy_weights=self.strategy_weights)
+        dl_tr = mk(dataset_tr, tr_transforms, initial_patch_size)
+        dl_val = mk(dataset_val, val_transforms, self.configuration_manager.patch_size)
+        allowed = get_allowed_n_proc_DA()
+        if allowed == 0:
+            return SingleThreadedAugmenter(dl_tr, None), SingleThreadedAugmenter(dl_val, None)
+        g1 = NonDetMultiThreadedAugmenter(dl_tr, None, allowed, max(6, allowed // 2), None,
+                                          self.device.type == 'cuda', wait_time=0.002)
+        g2 = NonDetMultiThreadedAugmenter(dl_val, None, max(1, allowed // 2), max(3, allowed // 4),
+                                          None, self.device.type == 'cuda', wait_time=0.002)
+        _ = next(g1); _ = next(g2)
+        return g1, g2
+
+    def initialize(self):
+        # build the 9-channel net (random), then surgically warm-start from nnInteractive.
+        # Call the GRANDPARENT initialize (skip ...FragNNI's load_pretrained_weights, which can't
+        # reshape the pruned/replicated stem).
+        trialsTrainerPengwinFrag.initialize(self)
+        ckpt = os.environ.get("PENGWIN_NNI_PRETRAINED")
+        if ckpt is not None and os.path.isfile(ckpt):
+            self._surgical_stem_load(ckpt)
+
+    def _surgical_stem_load(self, ckpt_path):
+        sd = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+        sd = sd.get('network_weights', sd)
+        net = self.network
+        net = getattr(net, '_orig_mod', net)   # torch.compile
+        net = getattr(net, 'module', net)      # DDP
+        msd = net.state_dict()
+        STEM = 'encoder.stem.convs.0.conv.weight'
+        # nnInteractive 8-ch input order: 0 image, 1 initSeg, 2/3 bbox+/-, 4 point+, 5 point-, 6/7 scrib+/-
+        POINT_POS, POINT_NEG = 4, 5
+        new, loaded, reinit = {}, 0, 0
+        for k, v in msd.items():
+            if k == STEM and k in sd and sd[k].shape[1] == 8 and v.shape[1] == 1 + 2 * self.N_STRAT:
+                src = sd[k]
+                w = v.clone()
+                w[:, 0] = src[:, 0]                                   # image
+                for si in range(self.N_STRAT):
+                    w[:, 1 + si] = src[:, POINT_POS]                  # ⊕ point -> each strategy's ⊕
+                    w[:, 1 + self.N_STRAT + si] = src[:, POINT_NEG]   # ⊖ point -> each strategy's ⊖
+                new[k] = w; loaded += 1
+            elif k in sd and sd[k].shape == v.shape:
+                new[k] = sd[k]; loaded += 1
+            else:
+                reinit += 1
+        net.load_state_dict(new, strict=False)
+        self.print_to_log_file(f"[strat] surgical warm-start from {ckpt_path}: loaded {loaded} "
+                               f"tensors, reinit {reinit} (stem point-channels replicated x{self.N_STRAT}).")
+
+
+class trialsTrainerPengwinFragStrat_debug(trialsTrainerPengwinFragStrat):
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device("cuda")):
         super().__init__(plans, configuration, fold, dataset_json, device)

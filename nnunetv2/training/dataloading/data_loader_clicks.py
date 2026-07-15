@@ -677,6 +677,71 @@ class nnUNetDataLoaderPengwinMulti(nnUNetDataLoader):
         return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
 
 
+class nnUNetDataLoaderPengwinFragStrat(nnUNetDataLoaderPengwinFrag):
+    """
+    Strategy-multiplexed per-fragment dataloader. Instead of a single ⊕/⊖ point-channel pair,
+    there is one pair PER click strategy (4 strategies -> 8 point channels). Each step samples a
+    strategy, simulates the click with it, and writes ⊕ (target fragment) / ⊖ (other fragments)
+    into THAT strategy's channels; the other strategies' channels stay zero. So the strategy is
+    encoded by channel identity, letting the model specialise (e.g. treat a boundary click, which
+    sits on the fracture, differently from a central one). Binary target, as usual.
+    """
+    N_STRAT = 4  # STRATEGIES order: uniform, edt, center_of_mass, boundary_internal_margin
+
+    def generate_train_batch(self):
+        from nnunetv2.training.dataloading.pengwin_clicks import sample_fragment_clicks, STRATEGIES
+        from nnunetv2.training.dataloading.nnInteractive_clicks import PointInteraction_stub
+        selected_keys = self.get_indices()
+        data_all = np.zeros(self.data_shape, dtype=np.float32)
+        seg_all = np.zeros(self.seg_shape, dtype=np.int16)
+
+        for j, i in enumerate(selected_keys):
+            force_fg = self.get_do_oversample(j)
+            data, seg, seg_prev, properties = self._data.load_case(i)
+            shape = data.shape[1:]
+            bbox_lbs, bbox_ubs = self.get_bbox(shape, force_fg, properties['class_locations'])
+            bbox = [[l, u] for l, u in zip(bbox_lbs, bbox_ubs)]
+            data_all[j] = crop_and_pad_nd(data, bbox, 0)
+            seg_all[j] = crop_and_pad_nd(seg, bbox, -1)
+
+        if self.patch_size_was_2d:
+            data_all = data_all[:, :, 0]
+            seg_all = seg_all[:, :, 0]
+
+        images, segs = [], []
+        with torch.no_grad():
+            with threadpool_limits(limits=1, user_api=None):
+                data_all = torch.from_numpy(data_all).float()
+                seg_all = torch.from_numpy(seg_all).to(torch.int16)
+                pi = PointInteraction_stub(point_radius=self.point_radius, use_distance_transform=True)
+                for b in range(self.batch_size):
+                    tmp = self.transforms(**{'image': data_all[b], 'segmentation': seg_all[b]})
+                    seg_b = tmp['segmentation']
+                    inst = seg_b[0].numpy().copy()
+                    inst[inst < 0] = 0
+                    strat = self._pick_strategy() or STRATEGIES[np.random.randint(len(STRATEGIES))]
+                    si = STRATEGIES.index(strat)
+
+                    target_label, fg_click, bg_clicks = sample_fragment_clicks(inst, strategy=strat)
+                    ch = torch.zeros((2 * self.N_STRAT, *inst.shape), dtype=torch.float32)
+                    if target_label is None:
+                        binary = torch.zeros_like(seg_b)
+                    else:
+                        ch[si] = pi.place_point(tuple(int(v) for v in fg_click), ch[si], binarize=False)
+                        for c in bg_clicks:
+                            ch[self.N_STRAT + si] = pi.place_point(tuple(int(v) for v in c),
+                                                                   ch[self.N_STRAT + si], binarize=False)
+                        binary = (seg_b == target_label).to(torch.int16)
+                    images.append(torch.cat((tmp['image'], ch), dim=0))
+                    segs.append(binary)
+
+                data_all = torch.stack(images)
+                seg_all = torch.stack(segs)
+                del images, segs
+
+        return {'data': data_all, 'target': seg_all, 'keys': selected_keys}
+
+
 class nnUNetDataLoaderClicksGeneratedHelper(nnUNetDataLoader):
     def __init__(self,
                  data: nnUNetBaseDataset,
