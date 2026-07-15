@@ -138,24 +138,36 @@ def _boundary_internal_margin_click(mask: np.ndarray, edt: np.ndarray) -> Coord:
 
 def simulate_click_in_fragment(frag_mask: np.ndarray, strategy: Optional[str] = None) -> Coord:
     """
-    Simulate a single click ``(z, y, x)`` inside a binary fragment mask, mirroring the
-    four challenge strategies. ``strategy=None`` picks one at random.
+    Simulate a single click ``(z, y, x)`` inside a binary fragment mask, mirroring the four
+    challenge strategies. ``strategy=None`` picks one at random. The EDT-based strategies run on
+    the fragment's bounding box (not the whole patch) for speed.
     """
     if strategy is None:
         strategy = STRATEGIES[np.random.randint(len(STRATEGIES))]
 
+    coords = np.argwhere(frag_mask)
+    if coords.shape[0] == 0:
+        return (0, 0, 0)
     if strategy == "uniformly_sampled":
-        return _uniform_click(frag_mask)
+        return tuple(int(v) for v in coords[np.random.randint(coords.shape[0])])
 
-    # The remaining strategies need the Euclidean distance transform of the fragment.
-    edt = fastedt.edt(frag_mask.astype(np.uint8))
+    # crop to the fragment bbox so the EDT is over a small array, then map the click back.
+    # Pad with a 1-voxel background border so surface voxels see background exactly as they do
+    # in the full volume -- this keeps the EDT (and the boundary_internal_margin shell) identical
+    # to computing it on the whole patch. Map back with the -1 pad offset.
+    mn = coords.min(0); mx = coords.max(0) + 1
+    sub = frag_mask[mn[0]:mx[0], mn[1]:mx[1], mn[2]:mx[2]]
+    sub = np.pad(sub, 1)
+    edt = fastedt.edt(sub.astype(np.uint8))
     if strategy == "euclidean_distance_transform":
-        return _edt_max_click(edt)
-    if strategy == "center_of_mass":
-        return _center_of_mass_click(frag_mask, edt)
-    if strategy == "boundary_internal_margin":
-        return _boundary_internal_margin_click(frag_mask, edt)
-    raise ValueError(f"Unknown click strategy {strategy!r}")
+        loc = _edt_max_click(edt)
+    elif strategy == "center_of_mass":
+        loc = _center_of_mass_click(sub, edt)
+    elif strategy == "boundary_internal_margin":
+        loc = _boundary_internal_margin_click(sub, edt)
+    else:
+        raise ValueError(f"Unknown click strategy {strategy!r}")
+    return tuple(int(loc[i]) - 1 + int(mn[i]) for i in range(3))
 
 
 def sample_fragment_clicks(
@@ -164,32 +176,35 @@ def sample_fragment_clicks(
     target_label: Optional[int] = None,
 ) -> Tuple[Optional[int], Optional[Coord], List[Coord]]:
     """
-    Given an instance label patch (0 = background, >0 = distinct fragment ids), pick one
-    target fragment and return ``(target_label, fg_click, [bg_clicks])`` where ``fg_click``
-    is a click inside the target fragment and ``bg_clicks`` are one click in each of the
-    *other* fragments -- the exact training signal used by the baseline fragment model.
+    Given an instance label patch (0 = background, >0 = distinct fragment ids), pick one target
+    fragment and return ``(target_label, fg_click, [bg_clicks])``. ``fg_click`` uses ``strategy``;
+    the negatives (one per other fragment) use a cheap uniform interior point -- a negative
+    prompt does not need a strategic location, and this removes an EDT per other fragment.
 
-    Returns ``(None, None, [])`` if the patch contains no fragment.
-    A single random ``strategy`` is used for all clicks of this sample (matching the
-    challenge, where one JSON file == one strategy).
+    Uses ``find_objects`` for one-pass bounding boxes, so per-fragment work is confined to small
+    crops. Returns ``(None, None, [])`` if the patch contains no fragment.
     """
-    labels = np.unique(seg_instance)
-    labels = labels[labels > 0]
-    if labels.size == 0:
+    maxid = int(seg_instance.max())
+    if maxid <= 0:
+        return None, None, []
+    seg32 = seg_instance if seg_instance.dtype == np.int32 else seg_instance.astype(np.int32)
+    objs = ndimage.find_objects(seg32)
+    labels = [l for l in range(1, maxid + 1) if l - 1 < len(objs) and objs[l - 1] is not None]
+    if not labels:
         return None, None, []
 
     if strategy is None:
         strategy = STRATEGIES[np.random.randint(len(STRATEGIES))]
-
-    if target_label is None:
+    if target_label is None or target_label not in labels:
         target_label = int(np.random.choice(labels))
 
-    fg_click = simulate_click_in_fragment(seg_instance == target_label, strategy)
-    bg_clicks = [
-        simulate_click_in_fragment(seg_instance == lbl, strategy)
-        for lbl in labels
-        if int(lbl) != target_label
-    ]
+    def click(lbl: int, strat: str) -> Coord:
+        sl = objs[lbl - 1]
+        loc = simulate_click_in_fragment(seg_instance[sl] == lbl, strat)
+        return tuple(int(loc[i]) + int(sl[i].start) for i in range(3))
+
+    fg_click = click(target_label, strategy)
+    bg_clicks = [click(l, "uniformly_sampled") for l in labels if l != target_label]
     return target_label, fg_click, bg_clicks
 
 
