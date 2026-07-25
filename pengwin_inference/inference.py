@@ -34,7 +34,7 @@ import SimpleITK as sitk
 import torch
 
 from nnunetv2.training.dataloading.pengwin_clicks import (
-    ANATOMY_RANGES, parse_pengwin_clicks, Coord,
+    ANATOMY_RANGES, parse_pengwin_clicks, strategy_index_from_json, Coord,
 )
 from pengwin_inference.postprocess import (
     keep_component_containing_point, merge_fragments, fill_anatomy_with_best_fragment,
@@ -42,6 +42,28 @@ from pengwin_inference.postprocess import (
 )
 from pengwin_inference.predict import FragmentPredictor, AnatomyPredictor, restore_labelmap_to_original
 from pengwin_inference.routing import classify_image, ROUTING_ALLOWED_ANATOMIES
+
+# "seeded" assembly knobs (env-overridable so the container can use them too):
+#   SEED_THR    hysteresis low threshold to grow each fragment down to (vs the hard 0.5)
+#   SEED_RADIUS radius (grid voxels) of the guaranteed-foreground ball pinned at the click
+SEED_THR = float(os.environ.get("PENGWIN_SEED_THR", "0.3"))
+SEED_RADIUS = int(os.environ.get("PENGWIN_SEED_RADIUS", "3"))
+
+
+def _seed_ball(shape, click, r: int) -> np.ndarray:
+    """A small binary ball around the click -- voxels we KNOW are the clicked fragment."""
+    m = np.zeros(shape, dtype=bool)
+    z, y, x = (int(v) for v in click)
+    if not (0 <= z < shape[0] and 0 <= y < shape[1] and 0 <= x < shape[2]):
+        return m
+    zsl = slice(max(0, z - r), min(shape[0], z + r + 1))
+    ysl = slice(max(0, y - r), min(shape[1], y + r + 1))
+    xsl = slice(max(0, x - r), min(shape[2], x + r + 1))
+    dz = (np.arange(zsl.start, zsl.stop) - z)[:, None, None]
+    dy = (np.arange(ysl.start, ysl.stop) - y)[None, :, None]
+    dx = (np.arange(xsl.start, xsl.stop) - x)[None, None, :]
+    m[zsl, ysl, xsl] = (dz * dz + dy * dy + dx * dx) <= r * r
+    return m
 
 # Grand Challenge default mount points
 GC_INPUT_CT_DIR = "/input/images/peripelvic-fracture-ct"
@@ -74,7 +96,7 @@ def merge_strategy_fragments(click_jsons: List[dict]) -> Dict[int, List[List[Coo
 
 def _predict_and_merge_grid(frag: FragmentPredictor, ct_data, properties,
                             per_anatomy_frags: Dict[int, List[List[Coord]]],
-                            assembly: str = "overwrite") -> np.ndarray:
+                            assembly: str = "overwrite", strategy_idx: int = 0) -> np.ndarray:
     """Per-fragment prediction -> keep clicked CC -> merge into the running instance label map,
     all in the model's GRID space. Merges incrementally (peak memory = a couple of grids, not a
     list of N masks -- important for the 16 GB budget).
@@ -84,58 +106,128 @@ def _predict_and_merge_grid(frag: FragmentPredictor, ct_data, properties,
                      earlier on overlap (ANATOMY_ORDER). Order decides contested voxels.
       "argmax"    -> probability competition: each contested voxel goes to the fragment with the
                      highest foreground probability (online argmax over `best_prob`/`best_label`).
-      "ownership" -> keep each fragment's binary mask, but resolve OVERLAPS by nearest click:
-                     a voxel claimed by >1 fragment goes to the one whose click is closest
-                     (Voronoi tie-break). Fixes the duplicate/collapse cases without touching
-                     non-contested voxels.
+      "ownership" -> keep each fragment's binary mask, but resolve OVERLAPS by nearest click
+                     (straight-line Voronoi tie-break). Cheap, but the split is at the click
+                     midplane -- often below IoU 0.5, so it tends not to help merged blobs.
+      "watershed" -> click-seeded watershed of the union of all fragment masks: floods each
+                     click's basin along the shape and splits at the thin fracture NECK
+                     (geodesic tie-break). Best shot at splitting over-merged blobs correctly.
+      "smaller"   -> overwrite, but the SMALLER fragment wins contested voxels (write largest
+                     first), so a small fragment inside a big over-segmentation is preserved.
     """
     grid_shape = tuple(ct_data.shape[1:])
     all_clicks = [c for frags in per_anatomy_frags.values() for fr in frags for c in fr]
-    merged = np.zeros(grid_shape, dtype=np.uint16)
-    best_prob = np.zeros(grid_shape, dtype=np.float32) if assembly == "argmax" else None
-    owner_dist = np.full(grid_shape, np.inf, dtype=np.float32) if assembly == "ownership" else None
 
-    for aid in ANATOMY_ORDER:
-        frags = per_anatomy_frags.get(aid, [])
-        lo, hi = ANATOMY_RANGES[aid]
-        for k, fg_list in enumerate(frags):
-            fg_set = {tuple(c) for c in fg_list}
-            bg = [c for c in all_clicks if tuple(c) not in fg_set]
-            label = min(lo + k, hi)
-            if assembly == "argmax":
-                prob, grid_click = frag.predict_fragment(ct_data, properties, fg_list, bg, return_prob=True)
-                cc = keep_component_containing_point(prob > 0.5, grid_click)  # restrict to clicked fragment
-                fp = prob * cc                                               # >0.5 inside the fragment, else 0
+    def _iter_masks():
+        """Yield (label, binary_mask_grid, grid_click) for every fragment (binary modes)."""
+        for aid in ANATOMY_ORDER:
+            lo, hi = ANATOMY_RANGES[aid]
+            for k, fg_list in enumerate(per_anatomy_frags.get(aid, [])):
+                fg_set = {tuple(c) for c in fg_list}
+                bg = [c for c in all_clicks if tuple(c) not in fg_set]
+                seg_grid, grid_click = frag.predict_fragment(ct_data, properties, fg_list, bg,
+                                                             strategy_idx=strategy_idx)
+                yield min(lo + k, hi), keep_component_containing_point(seg_grid, grid_click), grid_click
+
+    if assembly == "argmax":
+        merged = np.zeros(grid_shape, dtype=np.uint16)
+        best_prob = np.zeros(grid_shape, dtype=np.float32)
+        for aid in ANATOMY_ORDER:
+            lo, hi = ANATOMY_RANGES[aid]
+            for k, fg_list in enumerate(per_anatomy_frags.get(aid, [])):
+                fg_set = {tuple(c) for c in fg_list}
+                bg = [c for c in all_clicks if tuple(c) not in fg_set]
+                prob, grid_click = frag.predict_fragment(ct_data, properties, fg_list, bg,
+                                                         return_prob=True, strategy_idx=strategy_idx)
+                cc = keep_component_containing_point(prob > 0.5, grid_click)
+                fp = prob * cc
                 win = fp > best_prob
+                merged[win] = min(lo + k, hi)
+                best_prob[win] = fp[win]
+        return merged
+
+    if assembly == "seeded":
+        # Like argmax, but each fragment is grown by HYSTERESIS from a guaranteed-FG seed:
+        # keep the (prob > SEED_THR) component that owns the click -- lower than 0.5 so weak/
+        # cold fragments are recovered -- union a small pinned ball at the click, then let the
+        # fragments compete for contested voxels by probability. The pinned seed can never be
+        # stolen by a later fragment (we KNOW its label), so no clicked fragment is ever lost.
+        merged = np.zeros(grid_shape, dtype=np.uint16)
+        best_prob = np.zeros(grid_shape, dtype=np.float32)
+        for aid in ANATOMY_ORDER:
+            lo, hi = ANATOMY_RANGES[aid]
+            for k, fg_list in enumerate(per_anatomy_frags.get(aid, [])):
+                fg_set = {tuple(c) for c in fg_list}
+                bg = [c for c in all_clicks if tuple(c) not in fg_set]
+                prob, grid_click = frag.predict_fragment(ct_data, properties, fg_list, bg,
+                                                         return_prob=True, strategy_idx=strategy_idx)
+                label = min(lo + k, hi)
+                cc = keep_component_containing_point(prob > SEED_THR, grid_click).astype(bool)
+                seed = _seed_ball(grid_shape, grid_click, SEED_RADIUS)
+                cc |= seed
+                fp = prob * cc
+                win = cc & (fp > best_prob)
                 merged[win] = label
                 best_prob[win] = fp[win]
-                del prob, cc, fp, win
-            else:
-                seg_grid, grid_click = frag.predict_fragment(ct_data, properties, fg_list, bg)
-                m = keep_component_containing_point(seg_grid, grid_click)
-                if assembly == "ownership":
-                    coords = np.argwhere(m)
-                    if coords.size == 0:
-                        del seg_grid, m; continue
-                    sl = tuple(slice(int(coords[:, i].min()), int(coords[:, i].max()) + 1) for i in range(3))
-                    cz, cy, cx = grid_click
-                    zs = (np.arange(sl[0].start, sl[0].stop) - cz)[:, None, None]
-                    ys = (np.arange(sl[1].start, sl[1].stop) - cy)[None, :, None]
-                    xs = (np.arange(sl[2].start, sl[2].stop) - cx)[None, None, :]
-                    d = np.sqrt((zs ** 2 + ys ** 2 + xs ** 2).astype(np.float32))
-                    take = (m[sl] > 0) & (d < owner_dist[sl])   # only claim where this click is nearer
-                    merged[sl][take] = label
-                    owner_dist[sl][take] = d[take]
-                    del d, take
-                else:  # overwrite
-                    merged[m > 0] = label
-                del seg_grid, m
+                merged[seed] = label          # pin: guaranteed-FG voxels are final
+                best_prob[seed] = np.inf
+        return merged
+
+    if assembly == "watershed":
+        from scipy.ndimage import distance_transform_edt
+        from skimage.segmentation import watershed
+        union = np.zeros(grid_shape, dtype=bool)
+        markers = np.zeros(grid_shape, dtype=np.int32)
+        labels_list = []
+        for label, m, click in _iter_masks():
+            if m.sum() == 0:
+                continue
+            union |= m > 0
+            labels_list.append(label)
+            z, y, x = (int(v) for v in click)
+            if 0 <= z < grid_shape[0] and 0 <= y < grid_shape[1] and 0 <= x < grid_shape[2]:
+                markers[z, y, x] = len(labels_list)
+        merged = np.zeros(grid_shape, dtype=np.uint16)
+        if union.any():
+            ws = watershed(-distance_transform_edt(union), markers, mask=union)
+            for i, label in enumerate(labels_list, start=1):
+                merged[ws == i] = label
+        return merged
+
+    if assembly == "smaller":
+        items = [(int(m.sum()), label, m > 0) for label, m, _ in _iter_masks() if m.sum() > 0]
+        items.sort(key=lambda t: -t[0])   # largest first -> smaller written last -> smaller wins overlaps
+        merged = np.zeros(grid_shape, dtype=np.uint16)
+        for _, label, mask in items:
+            merged[mask] = label
+        return merged
+
+    # overwrite / ownership
+    merged = np.zeros(grid_shape, dtype=np.uint16)
+    owner_dist = np.full(grid_shape, np.inf, dtype=np.float32) if assembly == "ownership" else None
+    for label, m, grid_click in _iter_masks():
+        if assembly == "ownership":
+            coords = np.argwhere(m)
+            if coords.size == 0:
+                continue
+            sl = tuple(slice(int(coords[:, i].min()), int(coords[:, i].max()) + 1) for i in range(3))
+            cz, cy, cx = grid_click
+            zs = (np.arange(sl[0].start, sl[0].stop) - cz)[:, None, None]
+            ys = (np.arange(sl[1].start, sl[1].stop) - cy)[None, :, None]
+            xs = (np.arange(sl[2].start, sl[2].stop) - cx)[None, None, :]
+            d = np.sqrt((zs ** 2 + ys ** 2 + xs ** 2).astype(np.float32))
+            take = (m[sl] > 0) & (d < owner_dist[sl])
+            merged[sl][take] = label
+            owner_dist[sl][take] = d[take]
+        else:  # overwrite
+            merged[m > 0] = label
     return merged
 
 
 def _assemble(ct_path: str, per_anatomy_frags: Dict[int, List[List[Coord]]],
               output_path: Optional[str], frag: FragmentPredictor,
-              anat: Optional[AnatomyPredictor], routing: bool, assembly: str = "overwrite"):
+              anat: Optional[AnatomyPredictor], routing: bool, assembly: str = "overwrite",
+              strategy_idx: int = 0):
     ref_img = sitk.ReadImage(ct_path)
     if routing:
         case_type = classify_image(ref_img)
@@ -145,7 +237,7 @@ def _assemble(ct_path: str, per_anatomy_frags: Dict[int, List[List[Coord]]],
 
     # fragment model: assemble the instance map in GRID space, then restore to original ONCE
     ct_data, properties = frag.preprocess_ct(ct_path)
-    merged_grid = _predict_and_merge_grid(frag, ct_data, properties, per_anatomy_frags, assembly)
+    merged_grid = _predict_and_merge_grid(frag, ct_data, properties, per_anatomy_frags, assembly, strategy_idx)
     del ct_data
     merged = restore_labelmap_to_original(
         merged_grid, frag.predictor.plans_manager, frag.predictor.configuration_manager, properties)
@@ -173,9 +265,11 @@ def run_case(ct_path: str, clicks_path: str, output_path: Optional[str],
              routing: bool = False, assembly: str = "overwrite"):
     """Submission pipeline for one case with a SINGLE clicks JSON (one click per fragment)."""
     with open(clicks_path) as f:
-        per = parse_pengwin_clicks(json.load(f))
+        cj = json.load(f)
+    per = parse_pengwin_clicks(cj)
+    strategy_idx = strategy_index_from_json(cj)  # only used by the "strategy" click layout
     per_frags = {aid: [[p] for p in pts] for aid, pts in per.items()}
-    return _assemble(ct_path, per_frags, output_path, frag, anat, routing, assembly)
+    return _assemble(ct_path, per_frags, output_path, frag, anat, routing, assembly, strategy_idx)
 
 
 def run_case_combined(ct_path: str, clicks_paths: List[str], output_path: Optional[str],
@@ -188,7 +282,10 @@ def run_case_combined(ct_path: str, clicks_paths: List[str], output_path: Option
         with open(p) as f:
             jsons.append(json.load(f))
     per_frags = merge_strategy_fragments(jsons)
-    return _assemble(ct_path, per_frags, output_path, frag, anat, routing, assembly)
+    # combined mixes strategies; the "strategy" layout would need per-click routing, so just
+    # use the first strategy here (combined is intended for the pair/nninteractive layouts).
+    strategy_idx = strategy_index_from_json(jsons[0]) if jsons else 0
+    return _assemble(ct_path, per_frags, output_path, frag, anat, routing, assembly, strategy_idx)
 
 
 def _build_models():
@@ -200,11 +297,14 @@ def _build_models():
     roi_env = float(os.environ.get("PENGWIN_ROI_MULT", "1.5"))
     roi_mult = roi_env if roi_env > 0 else None
     ckpt = os.environ.get("PENGWIN_CHECKPOINT", "checkpoint_final.pth")
+    # Iterative refinement: extra passes feeding the previous prediction into the initSeg
+    # channel. nnInteractive layout only; tightens boundaries and splits over-merged fragments.
+    refine = int(os.environ.get("PENGWIN_REFINE", "0"))
     frag = FragmentPredictor(
         os.environ.get("PENGWIN_FRAG_MODEL", "/opt/ml/model/fragment"),
         fold=int(os.environ.get("PENGWIN_FRAG_FOLD", "0")),
         click_layout=layout, device=device, use_mirroring=tta, roi_mult=roi_mult,
-        checkpoint_name=ckpt)
+        checkpoint_name=ckpt, refine_iters=refine)
     anat = None
     if os.environ.get("PENGWIN_USE_ANATOMY", "0") == "1":
         anat = AnatomyPredictor(

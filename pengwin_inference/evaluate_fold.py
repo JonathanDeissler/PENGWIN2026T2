@@ -50,13 +50,16 @@ def main():
     ap.add_argument("--model", required=True, help="trained fragment model folder (nnU-Net results dir)")
     ap.add_argument("--raw", required=True, help="PENGWIN 'Extracted' root (image.mha/label.mha per case)")
     ap.add_argument("--clicks-root", default=None, help="default: <raw>/PENGWIN26_task2_train_clicks")
-    ap.add_argument("--click-layout", default="pair", choices=("pair", "nninteractive"))
+    ap.add_argument("--click-layout", default="pair", choices=("pair", "nninteractive", "strategy"))
     ap.add_argument("--strategies", nargs="+", default=list(STRATEGIES),
                     help="click strategies to evaluate (each CT+strategy is one challenge case)")
     ap.add_argument("--combine-strategies", action="store_true",
                     help="feed ALL --strategies at once (multiple clicks per fragment), one case per CT")
-    ap.add_argument("--assembly", default="overwrite", choices=("overwrite", "argmax"),
-                    help="overlap resolution: overwrite (last-writer) or argmax (probability competition)")
+    ap.add_argument("--assembly", default="overwrite",
+                    choices=("overwrite", "argmax", "ownership", "watershed", "smaller", "seeded"),
+                    help="overlap resolution: overwrite (last-writer), argmax (prob competition), "
+                         "ownership (nearest-click Voronoi), watershed (click-seeded, splits at "
+                         "fracture neck), smaller (smaller fragment wins contested voxels)")
     ap.add_argument("--anatomy-model", default=None, help="optional anatomy model folder")
     ap.add_argument("--routing", action="store_true")
     ap.add_argument("--iou-thr", type=float, default=0.5)
@@ -71,6 +74,9 @@ def main():
                          "to predict only a roi_mult*patch_size window around each click for extra "
                          "speed (safe as long as fragments fit the window; verify parity first).")
     ap.add_argument("--tta", action="store_true")
+    ap.add_argument("--refine", type=int, default=0,
+                    help="iterative-refinement passes (nninteractive layout only): feed the "
+                         "previous prediction into the initSeg channel and re-predict")
     ap.add_argument("--save-preds", action="store_true", help="also write predicted .mha files")
     ap.add_argument("--limit", type=int, default=None, help="only evaluate the first N val cases (quick check)")
     ap.add_argument("--profile-memory", action="store_true",
@@ -92,7 +98,8 @@ def main():
     roi_mult = args.roi_mult if args.roi_mult and args.roi_mult > 0 else None
     frag = FragmentPredictor(args.model, fold=args.fold, click_layout=args.click_layout,
                              device=device, use_mirroring=args.tta, checkpoint_name=args.checkpoint,
-                             roi_mult=roi_mult, point_radius=args.point_radius, point_width=args.point_width)
+                             roi_mult=roi_mult, point_radius=args.point_radius, point_width=args.point_width,
+                             refine_iters=args.refine)
     anat = (AnatomyPredictor(args.anatomy_model, fold=args.fold, device=device,
                              use_mirroring=args.tta, checkpoint_name=args.checkpoint)
             if args.anatomy_model else None)

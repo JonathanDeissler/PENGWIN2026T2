@@ -82,8 +82,14 @@ class FragmentPredictor:
                  device: torch.device = torch.device("cuda"), use_mirroring: bool = False,
                  predictor: Optional[nnUNetPredictor] = None,
                  checkpoint_name: str = "checkpoint_final.pth",
-                 roi_mult: Optional[float] = None):
-        assert click_layout in ("pair", "nninteractive")
+                 roi_mult: Optional[float] = None, n_strat: int = 4,
+                 refine_iters: int = 0):
+        assert click_layout in ("pair", "nninteractive", "strategy")
+        self.n_strat = n_strat  # for the "strategy" layout: one ⊕/⊖ channel pair per strategy
+        # refine_iters: extra passes that feed the previous binary prediction back into the
+        # nnInteractive initSeg channel (ch 0). 0 = single-shot. Only valid for the
+        # "nninteractive" layout (the only one with an initSeg channel).
+        self.refine_iters = refine_iters
         # roi_mult: if set, predict only a window of size roi_mult * patch_size centred on the
         # click instead of sliding over the whole volume -- a large speedup, since a fragment
         # is local. None -> full-volume sliding window.
@@ -105,13 +111,24 @@ class FragmentPredictor:
         data, properties = _preprocess_ct(self.predictor, ct_path)
         return torch.from_numpy(data).float(), properties
 
-    def _click_channels(self, shape, fg_zyx_grid: List[Coord], bg_zyx_grid: List[Coord]) -> torch.Tensor:
+    def _click_channels(self, shape, fg_zyx_grid: List[Coord], bg_zyx_grid: List[Coord],
+                        strategy_idx: int = 0) -> torch.Tensor:
         if self.click_layout == "pair":
             fg = render_points_gauss(shape, fg_zyx_grid, self.point_width)
             bg = render_points_gauss(shape, bg_zyx_grid, self.point_width)
             return torch.from_numpy(np.stack([fg, bg], 0)).float()
-        ch = torch.zeros((7, *shape), dtype=torch.float32)
         pi = PointInteraction_stub(point_radius=self.point_radius, use_distance_transform=True)
+        if self.click_layout == "strategy":
+            # 2*n_strat channels: ⊕ in slot [strategy_idx], ⊖ in slot [n_strat+strategy_idx]
+            ch = torch.zeros((2 * self.n_strat, *shape), dtype=torch.float32)
+            fi, bi = strategy_idx, self.n_strat + strategy_idx
+            for fc in fg_zyx_grid:
+                ch[fi] = pi.place_point(tuple(int(v) for v in fc), ch[fi], binarize=False)
+            for bc in bg_zyx_grid:
+                ch[bi] = pi.place_point(tuple(int(v) for v in bc), ch[bi], binarize=False)
+            return ch
+        # nninteractive: 7 interaction channels, point⊕=slot 3, point⊖=slot 4
+        ch = torch.zeros((7, *shape), dtype=torch.float32)
         for fc in fg_zyx_grid:
             ch[3] = pi.place_point(tuple(int(v) for v in fc), ch[3], binarize=False)
         for bc in bg_zyx_grid:
@@ -120,7 +137,7 @@ class FragmentPredictor:
 
     def predict_fragment(self, ct_data: torch.Tensor, properties: dict,
                          fg_clicks_zyx: List[Coord], bg_clicks_zyx: List[Coord],
-                         return_prob: bool = False):
+                         return_prob: bool = False, strategy_idx: int = 0):
         """Predict the fragment marked by ``fg_clicks_zyx`` (one or more positive clicks on the
         SAME fragment) with the other fragments' clicks as negatives.
 
@@ -139,12 +156,25 @@ class FragmentPredictor:
             v = torch.softmax(logits, 0)[1] if return_prob else (logits[1] > logits[0])
             return v.cpu().numpy().astype(np.float32 if return_prob else np.uint8)
 
+        refine = self.refine_iters
+        if refine and self.click_layout != "nninteractive":
+            raise ValueError("refine_iters needs the 'nninteractive' layout (initSeg channel 0)")
+
+        def _run(ct_win, clicks):
+            """Forward pass(es) over one window; between passes write the current binary mask
+            into the initSeg channel (ch 0) so the net can correct itself. Returns final logits."""
+            logits = None
+            for it in range(refine + 1):
+                logits = self.predictor.predict_sliding_window_return_logits(
+                    torch.cat((ct_win, clicks), dim=0))
+                if it < refine:  # feed prediction back as initSeg for the next pass
+                    clicks[0] = (logits[1] > logits[0]).float().cpu()
+            return logits
+
         out_grid = np.zeros(grid_shape, dtype=np.float32 if return_prob else np.uint8)
         if self.roi_mult is None:
-            clicks = self._click_channels(grid_shape, fg_grid, bg_grid)
-            net_in = torch.cat((ct_data, clicks), dim=0)
-            logits = self.predictor.predict_sliding_window_return_logits(net_in)
-            out_grid[:] = _fg(logits)
+            clicks = self._click_channels(grid_shape, fg_grid, bg_grid, strategy_idx)
+            out_grid[:] = _fg(_run(ct_data, clicks))
         else:
             # crop a window of roi_mult * patch_size centred on the (first) positive click
             patch = self.predictor.configuration_manager.patch_size
@@ -157,10 +187,8 @@ class FragmentPredictor:
             to_win = lambda p: tuple(int(pi) - st for pi, st in zip(p, starts))
             fg_win = [to_win(p) for p in fg_grid if inside(p)]
             bg_win = [to_win(p) for p in bg_grid if inside(p)]
-            clicks = self._click_channels(win_shape, fg_win, bg_win)
-            net_in = torch.cat((ct_data[(slice(None), *sl)], clicks), dim=0)
-            win_logits = self.predictor.predict_sliding_window_return_logits(net_in)
-            out_grid[sl] = _fg(win_logits)
+            clicks = self._click_channels(win_shape, fg_win, bg_win, strategy_idx)
+            out_grid[sl] = _fg(_run(ct_data[(slice(None), *sl)], clicks))
         return out_grid, fg_grid[0]
 
 

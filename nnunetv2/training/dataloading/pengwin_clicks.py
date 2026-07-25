@@ -59,6 +59,25 @@ STRATEGIES: Tuple[str, ...] = (
 
 Coord = Tuple[int, int, int]  # (z, y, x)
 
+# Map the substring in a clicks JSON's "name" (top-level or per-point) to the STRATEGIES index.
+STRATEGY_KEYWORDS = {
+    "Uniformly Sampled": 0,
+    "Euclidean Distance Transform": 1,
+    "Center of Mass": 2,
+    "Boundary Internal Margin": 3,
+}
+
+
+def strategy_index_from_json(click_json: dict, default: int = 2) -> int:
+    """Detect the click strategy (index into STRATEGIES) from a clicks JSON. Checks the
+    top-level 'name' first, then any point name. Falls back to ``default`` (center-of-mass)."""
+    names = [click_json.get("name", "")] + [p.get("name", "") for p in click_json.get("points", [])]
+    for name in names:
+        for kw, idx in STRATEGY_KEYWORDS.items():
+            if kw in name:
+                return idx
+    return default
+
 
 def label_to_anatomy_id(label: int) -> Optional[int]:
     """Map a PENGWIN instance label (1-200) to its anatomy id (1-4). 0 -> None."""

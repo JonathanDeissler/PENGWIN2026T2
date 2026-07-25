@@ -3608,6 +3608,88 @@ class trialsTrainerPengwinMulti_debug(trialsTrainerPengwinMulti):
         self.num_val_iterations_per_epoch = 2
 
 
+class trialsTrainerPengwinFragNNIRefine(trialsTrainerPengwinFragNNI):
+    """nnInteractive warm-start + REFINEMENT-AWARE training.
+
+    The plain ...NNI fine-tune leaves the nnInteractive ``initSeg`` channel (ch 0 of the 7
+    interaction channels == input channel 1, since CT is channel 0) at zero for every step, so
+    the model only *happens* to still refine because nnInteractive's pretrained initSeg pathway
+    survived. This trainer instead TRAINS that pathway: on a fraction (``refine_prob``) of steps
+    it runs the network once to get a first-pass prediction, writes that binary mask into the
+    initSeg channel, and only then does the supervised forward/backward -- so the weights learn
+    to *correct a prior mask*, exactly the iterative mode used at inference (PENGWIN_REFINE>=1).
+    The remaining steps keep initSeg=0 so single-shot (first pass) stays calibrated.
+
+    Everything else is identical to ...NNI (same nnInteractive plans, same -pretrained_weights):
+
+        nnUNetv2_train 458 3d_fullres_ps192 0 -tr trialsTrainerPengwinFragNNIRefine \\
+            -p nnUNetResEncUNetLPlans_noResampling \\
+            -pretrained_weights ~/.nninteractive/models/nnInteractive_v1.0/fold_0/checkpoint_final.pth
+
+    (or set PENGWIN_NNI_PRETRAINED instead of -pretrained_weights). Inference is unchanged:
+    ship with PENGWIN_CLICK_LAYOUT=nninteractive PENGWIN_REFINE=1.
+
+    NOTE: the self-conditioning forward roughly +50%s train time on refine steps. An alternative
+    prior source is a degraded GT mask (erode/dilate + drop/add a neighbour) -- cheaper and
+    lets you control prior quality -- but self-prediction is exactly on-distribution with
+    inference, so it is the default.
+    """
+
+    INITSEG_CH = 1  # input-tensor channel index of nnInteractive's initSeg (CT is channel 0)
+
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.refine_prob = 0.5  # fraction of steps conditioned on a self-predicted prior
+
+    def train_step(self, batch: dict) -> dict:
+        data = batch['data'].to(self.device, non_blocking=True)
+        target = batch['target']
+        target = ([t.to(self.device, non_blocking=True) for t in target]
+                  if isinstance(target, list) else target.to(self.device, non_blocking=True))
+
+        # With prob refine_prob: first-pass prediction -> initSeg channel, then train to refine it.
+        if self.refine_prob > 0 and np.random.uniform() < self.refine_prob:
+            was_training = self.network.training
+            self.network.eval()  # use inherited (nnInteractive) BN stats; don't pollute them
+            with torch.no_grad(), (autocast(self.device.type, enabled=True)
+                                   if self.device.type == 'cuda' else dummy_context()):
+                out0 = self.network(data)
+                out0 = out0[0] if isinstance(out0, (list, tuple)) else out0
+                prior = (out0.argmax(1, keepdim=True) > 0).to(data.dtype)
+            if was_training:
+                self.network.train()
+            data = data.clone()
+            data[:, self.INITSEG_CH:self.INITSEG_CH + 1] = prior
+
+        self.optimizer.zero_grad(set_to_none=True)
+        with autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            output = self.network(data)
+            l = self.loss(output, target)
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(l).backward()
+            self.grad_scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            l.backward()
+            torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
+            self.optimizer.step()
+        return {'loss': l.detach().cpu().numpy()}
+
+
+class trialsTrainerPengwinFragNNIRefine_debug(trialsTrainerPengwinFragNNIRefine):
+    """Fast smoke-test: a couple of epochs / few iters so the refine train_step path runs."""
+
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 2
+        self.num_iterations_per_epoch = 5
+        self.num_val_iterations_per_epoch = 2
+
+
 # ======================================================================================
 # Strategy-multiplexed, pruned-stem fragment model (per-fragment binary)
 # ======================================================================================
