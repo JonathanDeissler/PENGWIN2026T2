@@ -497,7 +497,8 @@ class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
                  point_width: float = 1.0,
                  click_layout: str = "pair",
                  point_radius: float = 4.0,
-                 strategy_weights: dict = None):
+                 strategy_weights: dict = None,
+                 hard_neg_k: int = 0, hard_neg_band: int = 6):
         """
         click_layout:
           "pair"          -> append 2 channels [fg_gauss, bg_gauss]   (ablation B, ResEnc points net)
@@ -518,6 +519,8 @@ class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
         self.click_layout = click_layout
         self.point_radius = point_radius
         self.strategy_weights = strategy_weights
+        self.hard_neg_k = hard_neg_k       # extra negatives across the nearest fracture line
+        self.hard_neg_band = hard_neg_band # within this many voxels of the target boundary
 
     def _pick_strategy(self):
         if not self.strategy_weights:
@@ -525,6 +528,28 @@ class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
         names = list(self.strategy_weights)
         w = np.array([self.strategy_weights[n] for n in names], dtype=np.float64)
         return names[int(np.random.choice(len(names), p=w / w.sum()))]
+
+    def _hard_negatives(self, inst, target_label):
+        """Sample up to hard_neg_k negatives on OTHER fragments within hard_neg_band voxels of
+        the target fragment's surface -- i.e. right across the nearest fracture line. Teaches the
+        model to stop at the fracture instead of bleeding into the neighbour."""
+        from scipy import ndimage
+        k, band = self.hard_neg_k, self.hard_neg_band
+        P = inst == target_label
+        others = (inst > 0) & (~P)
+        if not P.any() or not others.any():
+            return []
+        c = np.argwhere(P)
+        lo = np.maximum(c.min(0) - band - 1, 0)
+        hi = np.minimum(c.max(0) + band + 2, np.array(inst.shape))
+        sl = tuple(slice(int(a), int(b)) for a, b in zip(lo, hi))
+        dist = ndimage.distance_transform_edt(~P[sl])          # distance to target within crop
+        band_mask = (dist <= band) & others[sl]
+        pts = np.argwhere(band_mask)
+        if pts.size == 0:
+            return []
+        idx = np.random.choice(len(pts), size=min(k, len(pts)), replace=False)
+        return [tuple(int(v) for v in (pts[m] + lo)) for m in idx]
 
     def _build_click_channels(self, shape, fg_click, bg_clicks):
         """Return a (C_extra, *shape) float32 tensor of click channels for the chosen layout."""
@@ -580,6 +605,8 @@ class nnUNetDataLoaderPengwinFrag(nnUNetDataLoader):
                     else:
                         binary = (seg_b == target_label).to(torch.int16)
 
+                    if target_label is not None and self.hard_neg_k:
+                        bg_clicks = list(bg_clicks) + self._hard_negatives(inst, target_label)
                     clicks = self._build_click_channels(inst.shape, fg_click, bg_clicks)
                     images.append(torch.cat((tmp['image'], clicks), dim=0))
                     segs.append(binary)

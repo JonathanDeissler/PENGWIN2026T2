@@ -56,7 +56,7 @@ def main():
     ap.add_argument("--combine-strategies", action="store_true",
                     help="feed ALL --strategies at once (multiple clicks per fragment), one case per CT")
     ap.add_argument("--assembly", default="overwrite",
-                    choices=("overwrite", "argmax", "ownership", "watershed", "smaller", "seeded"),
+                    choices=("overwrite", "argmax", "argmax_split", "argmax_correct", "ownership", "watershed", "smaller", "seeded"),
                     help="overlap resolution: overwrite (last-writer), argmax (prob competition), "
                          "ownership (nearest-click Voronoi), watershed (click-seeded, splits at "
                          "fracture neck), smaller (smaller fragment wins contested voxels)")

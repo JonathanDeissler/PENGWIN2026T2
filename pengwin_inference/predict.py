@@ -137,7 +137,8 @@ class FragmentPredictor:
 
     def predict_fragment(self, ct_data: torch.Tensor, properties: dict,
                          fg_clicks_zyx: List[Coord], bg_clicks_zyx: List[Coord],
-                         return_prob: bool = False, strategy_idx: int = 0):
+                         return_prob: bool = False, strategy_idx: int = 0,
+                         extra_bg_grid: Optional[List[Coord]] = None):
         """Predict the fragment marked by ``fg_clicks_zyx`` (one or more positive clicks on the
         SAME fragment) with the other fragments' clicks as negatives.
 
@@ -151,6 +152,8 @@ class FragmentPredictor:
         # map original (z,y,x) clicks onto the resampled grid (preprocess_point expects [x,y,z])
         fg_grid = [tuple(preprocess_point(zyx_to_xyz(c), properties, grid_shape)) for c in fg_clicks_zyx]
         bg_grid = [tuple(preprocess_point(zyx_to_xyz(c), properties, grid_shape)) for c in bg_clicks_zyx]
+        if extra_bg_grid:  # corrective negatives are ALREADY in grid (z,y,x); skip the mapping
+            bg_grid = bg_grid + [tuple(int(v) for v in c) for c in extra_bg_grid]
 
         def _fg(logits):  # foreground prob (float32) or binary (uint8)
             v = torch.softmax(logits, 0)[1] if return_prob else (logits[1] > logits[0])

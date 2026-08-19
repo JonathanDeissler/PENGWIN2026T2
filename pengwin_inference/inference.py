@@ -49,6 +49,32 @@ from pengwin_inference.routing import classify_image, ROUTING_ALLOWED_ANATOMIES
 SEED_THR = float(os.environ.get("PENGWIN_SEED_THR", "0.3"))
 SEED_RADIUS = int(os.environ.get("PENGWIN_SEED_RADIUS", "3"))
 
+# Adaptive refinement cap: cost is linear in fragments * (refine+1) passes; bound TOTAL
+# passes/case to REFINE_MAX_PASSES and pick the largest refine level that fits:
+# refine = clamp(floor(budget / n_frag) - 1, 0, base). Protects flat refine=1 too.
+REFINE_MAX_PASSES = int(os.environ.get("PENGWIN_REFINE_MAX_PASSES", "60"))
+
+# Min-size instance filter (precision): drop any final instance smaller than MIN_CM3 cm^3
+# -- removes spurious specks/bled slivers that count as false-positive instances. 0 = off.
+MIN_CM3 = float(os.environ.get("PENGWIN_MIN_CM3", "0"))  # off by default (no measured benefit)
+
+
+def _remove_small_instances(labelmap: np.ndarray, spacing_xyz, min_cm3: float) -> np.ndarray:
+    """Zero out labels below min_cm3 (spacing is SimpleITK (x,y,z) mm). Each PENGWIN label
+    is one fragment, so per-label size == per-instance size."""
+    if min_cm3 <= 0:
+        return labelmap
+    voxel_vol = float(np.prod(spacing_xyz))
+    min_vox = max(1, int(round(min_cm3 * 1000.0 / voxel_vol)))
+    counts = np.bincount(labelmap.reshape(-1))
+    small = np.nonzero(counts < min_vox)[0]
+    small = small[small > 0]
+    if small.size:
+        labelmap[np.isin(labelmap, small)] = 0
+        print(f'[min-size] dropped {small.size} instance(s) < {min_cm3} cm^3 '
+              f'({min_vox} vox): {sorted(small.tolist())}')
+    return labelmap
+
 
 def _seed_ball(shape, click, r: int) -> np.ndarray:
     """A small binary ball around the click -- voxels we KNOW are the clicked fragment."""
@@ -118,6 +144,19 @@ def _predict_and_merge_grid(frag: FragmentPredictor, ct_data, properties,
     grid_shape = tuple(ct_data.shape[1:])
     all_clicks = [c for frags in per_anatomy_frags.values() for fr in frags for c in fr]
 
+    # adaptive refinement cap (see REFINE_MAX_PASSES): refine level from fragment count
+    if not hasattr(frag, '_refine_base'):
+        frag._refine_base = frag.refine_iters
+    n_frag = sum(len(frs) for frs in per_anatomy_frags.values())
+    base = frag._refine_base
+    if base > 0 and n_frag > 0:
+        capped = max(0, min(base, REFINE_MAX_PASSES // n_frag - 1))
+        if capped != base:
+            print(f'[refine-cap] {n_frag} fragments -> refine={capped} (base {base}, budget {REFINE_MAX_PASSES})')
+        frag.refine_iters = capped
+    else:
+        frag.refine_iters = base
+
     def _iter_masks():
         """Yield (label, binary_mask_grid, grid_click) for every fragment (binary modes)."""
         for aid in ANATOMY_ORDER:
@@ -129,9 +168,18 @@ def _predict_and_merge_grid(frag: FragmentPredictor, ct_data, properties,
                                                              strategy_idx=strategy_idx)
                 yield min(lo + k, hi), keep_component_containing_point(seg_grid, grid_click), grid_click
 
-    if assembly == "argmax":
+    if assembly in ("argmax", "argmax_split"):
+        # argmax: contested voxels go to the highest-probability fragment.
+        # argmax_split: uncontested voxels stay argmax, but voxels claimed by >=2 fragments
+        # are re-assigned to the NEAREST click (Voronoi split) -- fixes the split plane where
+        # a bled/over-merged boundary would otherwise be decided by an over-confident fragment.
+        split = assembly == "argmax_split"
         merged = np.zeros(grid_shape, dtype=np.uint16)
         best_prob = np.zeros(grid_shape, dtype=np.float32)
+        if split:
+            claim = np.zeros(grid_shape, dtype=np.uint8)          # #fragments claiming each voxel
+            own_label = np.zeros(grid_shape, dtype=np.uint16)     # label of nearest claiming click
+            own_dist = np.full(grid_shape, np.inf, dtype=np.float32)
         for aid in ANATOMY_ORDER:
             lo, hi = ANATOMY_RANGES[aid]
             for k, fg_list in enumerate(per_anatomy_frags.get(aid, [])):
@@ -139,11 +187,88 @@ def _predict_and_merge_grid(frag: FragmentPredictor, ct_data, properties,
                 bg = [c for c in all_clicks if tuple(c) not in fg_set]
                 prob, grid_click = frag.predict_fragment(ct_data, properties, fg_list, bg,
                                                          return_prob=True, strategy_idx=strategy_idx)
+                label = min(lo + k, hi)
                 cc = keep_component_containing_point(prob > 0.5, grid_click)
                 fp = prob * cc
                 win = fp > best_prob
-                merged[win] = min(lo + k, hi)
+                merged[win] = label
                 best_prob[win] = fp[win]
+                if split:
+                    ccb = cc > 0
+                    claim[ccb] += 1
+                    coords = np.argwhere(ccb)
+                    if coords.size:
+                        sl = tuple(slice(int(coords[:, i].min()), int(coords[:, i].max()) + 1)
+                                   for i in range(3))
+                        cz, cy, cx = grid_click
+                        zs = (np.arange(sl[0].start, sl[0].stop) - cz)[:, None, None]
+                        ys = (np.arange(sl[1].start, sl[1].stop) - cy)[None, :, None]
+                        xs = (np.arange(sl[2].start, sl[2].stop) - cx)[None, None, :]
+                        d = np.sqrt((zs * zs + ys * ys + xs * xs).astype(np.float32))
+                        sub = ccb[sl] & (d < own_dist[sl])
+                        own_label[sl][sub] = label
+                        own_dist[sl][sub] = d[sub]
+        if split:
+            contested = claim >= 2
+            merged[contested] = own_label[contested]
+        return merged
+
+    if assembly == "argmax_correct":
+        # Two-stage argmax with CORRECTIVE NEGATIVE CLICKS. Stage 1: predict every fragment and
+        # keep its clicked-component mask. Where two fragments' masks overlap, one bled across the
+        # fracture line; we drop a negative click at the deepest incursion (the overlap voxel
+        # farthest from the intruder's own click / nearest the neighbour's click) and re-predict
+        # the intruder. The geometry only PLACES the prompt -- the network still draws the actual
+        # boundary (unlike argmax_split, which used the geometric midplane as the cut and failed).
+        CORR_MIN_OVL = int(os.environ.get("PENGWIN_CORR_MIN_OVL", "30"))  # min overlap voxels to act
+        frags = []
+        for aid in ANATOMY_ORDER:
+            lo, hi = ANATOMY_RANGES[aid]
+            for k, fg_list in enumerate(per_anatomy_frags.get(aid, [])):
+                fg_set = {tuple(c) for c in fg_list}
+                base_bg = [c for c in all_clicks if tuple(c) not in fg_set]
+                prob, grid_click = frag.predict_fragment(ct_data, properties, fg_list, base_bg,
+                                                         return_prob=True, strategy_idx=strategy_idx)
+                mask = keep_component_containing_point(prob > 0.5, grid_click).astype(bool)
+                frags.append(dict(label=min(lo + k, hi), fg=fg_list, base_bg=base_bg,
+                                  click=tuple(int(v) for v in grid_click),
+                                  prob=prob.astype(np.float16), mask=mask))
+        # detect overlaps -> corrective negatives (grid (z,y,x)) per intruding fragment
+        corr = {i: [] for i in range(len(frags))}
+        for i in range(len(frags)):
+            for j in range(i + 1, len(frags)):
+                ov = frags[i]['mask'] & frags[j]['mask']
+                if int(ov.sum()) < CORR_MIN_OVL:
+                    continue
+                coords = np.argwhere(ov).astype(np.float32)
+                ci = np.array(frags[i]['click'], np.float32)
+                cj = np.array(frags[j]['click'], np.float32)
+                di = np.linalg.norm(coords - ci, axis=1)
+                dj = np.linalg.norm(coords - cj, axis=1)
+                near_j = dj < di   # overlap on j's side -> i intruded
+                if near_j.any():
+                    sub = coords[near_j]; corr[i].append(tuple(int(v) for v in sub[di[near_j].argmax()]))
+                near_i = di < dj   # overlap on i's side -> j intruded
+                if near_i.any():
+                    sub = coords[near_i]; corr[j].append(tuple(int(v) for v in sub[dj[near_i].argmax()]))
+        ncorr = sum(1 for i in corr if corr[i])
+        if ncorr:
+            print(f'[correct] {ncorr}/{len(frags)} fragment(s) got corrective negatives')
+        # stage 2: re-predict corrected fragments; final argmax over (corrected) probabilities
+        merged = np.zeros(grid_shape, dtype=np.uint16)
+        best_prob = np.zeros(grid_shape, dtype=np.float32)
+        for i, fr in enumerate(frags):
+            if corr[i]:
+                prob, _ = frag.predict_fragment(ct_data, properties, fr['fg'], fr['base_bg'],
+                                                return_prob=True, strategy_idx=strategy_idx,
+                                                extra_bg_grid=corr[i])
+                cc = keep_component_containing_point(prob > 0.5, fr['click']).astype(bool)
+            else:
+                prob = fr['prob'].astype(np.float32); cc = fr['mask']
+            fp = prob * cc
+            win = fp > best_prob
+            merged[win] = fr['label']
+            best_prob[win] = fp[win]
         return merged
 
     if assembly == "seeded":
@@ -250,6 +375,8 @@ def _assemble(ct_path: str, per_anatomy_frags: Dict[int, List[List[Coord]]],
             in_range = (merged >= lo) & (merged <= hi)
             merged[in_range & (anat_map != aid)] = 0
         merged = fill_anatomy_with_best_fragment(anat_map, merged)
+
+    merged = _remove_small_instances(merged, ref_img.GetSpacing(), MIN_CM3)
 
     if output_path is not None:
         out = sitk.GetImageFromArray(merged.astype(np.uint8))

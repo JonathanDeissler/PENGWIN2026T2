@@ -3286,6 +3286,8 @@ class trialsTrainerPengwinFrag(trialsTrainerClickGen):
             click_layout=self.click_layout,
             point_radius=self.point_radius,
             strategy_weights=self.strategy_weights,
+            hard_neg_k=getattr(self, 'hard_neg_k', 0),
+            hard_neg_band=getattr(self, 'hard_neg_band', 6),
         )
         dl_val = nnUNetDataLoaderPengwinFrag(
             dataset_val,
@@ -3302,6 +3304,8 @@ class trialsTrainerPengwinFrag(trialsTrainerClickGen):
             click_layout=self.click_layout,
             point_radius=self.point_radius,
             strategy_weights=self.strategy_weights,
+            hard_neg_k=getattr(self, 'hard_neg_k', 0),
+            hard_neg_band=getattr(self, 'hard_neg_band', 6),
         )
 
         allowed_num_processes = get_allowed_n_proc_DA()
@@ -3681,6 +3685,62 @@ class trialsTrainerPengwinFragNNIRefine(trialsTrainerPengwinFragNNI):
 
 class trialsTrainerPengwinFragNNIRefine_debug(trialsTrainerPengwinFragNNIRefine):
     """Fast smoke-test: a couple of epochs / few iters so the refine train_step path runs."""
+
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 2
+        self.num_iterations_per_epoch = 5
+        self.num_val_iterations_per_epoch = 2
+
+
+class trialsTrainerPengwinFragNNIRefineHN(trialsTrainerPengwinFragNNIRefine):
+    """Refinement-aware fine-tune that SHARPENS FRACTURE SPLITS, to reduce over-merge / low
+    instance precision. Two changes vs. ...Refine:
+
+      (1) HARD NEGATIVES across the fracture line: besides the other fragments' clicks, the
+          dataloader samples `hard_neg_k` negative points on neighbouring fragments within
+          `hard_neg_band` voxels of the target's surface -- i.e. right where bleed happens --
+          so the model is trained to stop at the fracture rather than grow past it.
+      (2) FP-penalising Focal-Tversky + CE loss (beta > alpha) so a fragment bleeding into a
+          neighbour (a false positive) is punished harder than a small miss.
+
+    Intended as a SHORT fine-tune FROM the 1k_ref checkpoint (weights only), e.g.:
+
+        nnUNetv2_train 458 3d_fullres_ps192_bs2 0 -tr trialsTrainerPengwinFragNNIRefineHN \
+            -p nnUNetResEncUNetLPlans_noResampling \
+            -pretrained_weights <1k_ref checkpoint_best.pth>
+
+    (use -pretrained_weights, NOT --c, so it loads weights and trains a fresh short schedule.)
+    """
+
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device("cuda")):
+        super().__init__(plans, configuration, fold, dataset_json, device)
+        self.num_epochs = 150          # short fine-tune from the 1k_ref weights
+        self.initial_lr = 1e-4         # gentle
+        self.hard_neg_k = 3            # negatives sampled across the nearest fracture line
+        self.hard_neg_band = 6         # within this many voxels of the target boundary
+
+    def _build_loss(self):
+        # beta > alpha -> false positives (bleed into a neighbour) cost more than false negatives
+        loss = FocalTversky_and_CE_loss(
+            {"batch_dice": self.configuration_manager.batch_dice, "smooth": 0, "do_bg": False,
+             "ddp": self.is_ddp, "gamma": 1.3, "alpha": 0.3, "beta": 0.7},
+            {}, weight_ce=1, weight_dice=1,
+            ignore_label=self.label_manager.ignore_label,
+            dice_class=MemoryEfficientSoftDiceLoss)
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            weights[-1] = 0
+            weights = weights / weights.sum()
+            loss = DeepSupervisionWrapper(loss, weights)
+        return loss
+
+
+class trialsTrainerPengwinFragNNIRefineHN_debug(trialsTrainerPengwinFragNNIRefineHN):
+    """Fast smoke-test of the hard-negative + FP-Tversky path."""
 
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device("cuda")):
