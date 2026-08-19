@@ -114,3 +114,12 @@ ENV/
 *.model
 
 !documentation/assets/scribble_example.png
+
+eval_*/
+# PENGWIN submission build artifacts / scratch (not source)
+*.tar.gz
+*.err
+scratch_*/
+scratch_*.log
+.claude/
+model_*/
