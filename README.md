@@ -10,7 +10,7 @@ This repository is a research fork of **nnU-Net v2**; the submission code lives 
 how to **build and run the final Task 2 container**. For the training recipe and data conversion
 see [`pengwin_inference/README.md`](pengwin_inference/README.md).
 
-## Method (one paragraph)
+## Method
 
 Per fragment, the model does **click-conditioned binary segmentation** — the fragment's own click
 is the positive prompt, all other fragments' clicks are negatives — so it runs **one forward pass
@@ -35,7 +35,7 @@ this fork editable + `connected-components-3d` and `edt`); it needs **no network
 
 ## Model weights
 
-Weights are **not** in this repo. Download and extract them so a `fragment/` folder sits at the
+Weights are **not** in this repo. [**Download**](https://hub.dkfz.de/s/FTMkykaCL2rPzZ5)  and extract them so a `fragment/` folder sits at the
 root of the model directory:
 
 ```
@@ -48,7 +48,7 @@ root of the model directory:
         └── checkpoint_best.pth      # 8-channel nnInteractive-warm-started refine model
 ```
 
-- **Download link:** `<<ADD YOUR DOWNLOAD LINK HERE — e.g. Google Drive>>`
+- [**Download link:**](https://hub.dkfz.de/s/FTMkykaCL2rPzZ5) 
 - On Grand Challenge the model tarball is uploaded separately and auto-extracted to
   `/opt/ml/model`, i.e. the checkpoint ends up at `/opt/ml/model/fragment/fold_0/checkpoint_best.pth`.
 - Make the files world-readable (`chmod -R a+rX <MODEL_DIR>`): the container runs as uid 1000.
