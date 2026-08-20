@@ -111,9 +111,9 @@ See [`pengwin_inference/README.md`](pengwin_inference/README.md) for data conver
 training recipe. The submitted model is trained with:
 
 ```bash
-# fold 0 matches the fragment/fold_0/ layout the weights ship in; use `all` to retrain on the
-# full training set for a final all-data model.
-nnUNetv2_train 458 3d_fullres_ps192_bs2 0 -tr trialsTrainerPengwinFragNNIRefine \
+# Final submitted model: batch size 4, trained on ALL cases (fold "all"). The resulting
+# checkpoint is shipped under fragment/fold_0/ so the container (PENGWIN_FRAG_FOLD=0) loads it.
+nnUNetv2_train 458 3d_fullres_ps192_bs4 all -tr trialsTrainerPengwinFragNNIRefine \
     -p nnUNetResEncUNetLPlans_noResampling \
     -pretrained_weights <nnInteractive_v1.0/fold_0/checkpoint_final.pth>
 ```
